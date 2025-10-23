@@ -9,6 +9,7 @@ from utils import load_config
 
 
 def main():
+    # Parser definition
     parser = argparse.ArgumentParser(description="Paxos DA project")
     parser.add_argument("-r", "--role", help="Role of the process")
     parser.add_argument("-p", "--pid", help="Id of the process")
@@ -20,6 +21,7 @@ def main():
     role = args.role
     node_id = int(args.pid)
 
+    # Load configuration from 
     config = load_config()
 
     logging.basicConfig(

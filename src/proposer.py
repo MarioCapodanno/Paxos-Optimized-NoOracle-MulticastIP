@@ -1,13 +1,42 @@
 import logging
 from utils import mcast_receiver, mcast_sender, decode_message, encode_message, RndGeq
 
+NUM_PROPOSERS = 2
+NUM_ACCEPTORS = 3
 
 class Proposer:
     def __init__(self, config, id):
         self.config = config
         self.id = id
-        self.r = mcast_receiver(config["proposers"])
+        # Socket for receiving values from clients
+        self.client_r = mcast_receiver(config["proposers"])
+        # Socket for synchronizing state by listening to decisions
+        self.learner_r = mcast_receiver(config["learners"])
         self.s = mcast_sender()
+        
+        self.majority = (NUM_ACCEPTORS // 2) + 1
+        # This counter tracks the next known available instance
+        self.next_instance = 0
+        self.c_rnd = self.id - 1
+        # Buffer for client values that arrive while processing Paxos messages
+        self.pending_client_values = []
+
+    def sync_instance(self):
+        """Non-blockingly read all pending decisions to update our instance counter."""
+        while True:
+            # Poll the learner socket with a zero timeout.
+            ready, _, _ = select.select([self.learner_r], [], [], 0.0)
+            if not ready:
+                break  # No more pending decision messages
+            
+            msg, _ = self.learner_r.recvfrom(2**16)
+            try:
+                data = json.loads(msg.decode())
+                if data.get('type') == 'DECISION':
+                    # A decision was made. Ensure our next instance is ahead of it.
+                    self.next_instance = max(self.next_instance, data['inst'] + 1)
+            except (json.JSONDecodeError, KeyError):
+                continue
 
         self.ballot_counter = 0
         self.num_acceptors = 3  # as specified in the requirements

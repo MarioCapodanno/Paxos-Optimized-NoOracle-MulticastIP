@@ -8,6 +8,8 @@ class Learner:
         self.config = config
         self.id = id
         self.r = mcast_receiver(config["learners"])
+        self.next_instance_to_print = 0
+        self.buffer = {} # Buffer for out-of-order instances
 
         # Track learned values with a set to avoid duplicates
         self.learned = set()

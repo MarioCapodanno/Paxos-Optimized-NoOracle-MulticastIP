@@ -1,13 +1,16 @@
 import logging
 from utils import mcast_receiver, mcast_sender, decode_message, encode_message, RndGeq
 
-
 class Acceptor:
     def __init__(self, config, id):
         self.config = config
         self.id = id
         self.r = mcast_receiver(config["acceptors"])
         self.s = mcast_sender()
+        
+        # State is now per-instance
+        # self.instances[instance_id] = (rnd, v_rnd, v_val)
+        self.instances = {}
 
         self.promised_rnd = (-1, -1)  # just initialized to -1,-1
         self.accepted_rnd = (-1, -1)

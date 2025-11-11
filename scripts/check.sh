@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-NUM_CLIENTS=2
+NUM_CLIENTS=3
 NUM_LEARNERS=2
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

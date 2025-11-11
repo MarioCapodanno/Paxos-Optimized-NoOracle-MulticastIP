@@ -58,6 +58,16 @@ def encode_message(msg_type, *args):
 def decode_message(msg_bytes):
     """Decode a Paxos message from bytes to tuple"""
     msg_str = msg_bytes.decode()
+    
+    # Try JSON first (for MultiPaxos)
+    try:
+        data = json.loads(msg_str)
+        if isinstance(data, dict) and 'type' in data:
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    
+    # Fall back to pipe-separated format (for backward compatibility)
     parts = msg_str.split("|")  # msg is in the format "msg_type|arg1|arg2|..."
 
     # Convert numeric fields

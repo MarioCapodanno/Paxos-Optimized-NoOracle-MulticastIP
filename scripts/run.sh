@@ -121,8 +121,9 @@ pkill -f "python3 src/main.py"
 
 # --- Generating config ---
 
-jq -n --arg ip "$MCAST_IP" \
-  '{clients: {ip: $ip, port: 5000},
+jq -n --arg ip "$MCAST_IP" --arg n "$NUM_ACCEPTORS" \
+  '{n: $n,
+    clients: {ip: $ip, port: 5000},
     proposers: {ip: $ip, port: 6000},
     acceptors: {ip: $ip, port: 7000},
     learners: {ip: $ip, port: 8000}}' > logs/config.json

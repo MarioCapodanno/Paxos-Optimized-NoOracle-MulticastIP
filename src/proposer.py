@@ -1,7 +1,5 @@
 import logging
-import json
-import select  # We need the select module for non-blocking reads
-from utils import mcast_receiver, mcast_sender
+from utils import mcast_receiver, mcast_sender, decode_message, encode_message, RndGeq
 
 NUM_PROPOSERS = 2
 NUM_ACCEPTORS = 3
@@ -40,100 +38,198 @@ class Proposer:
             except (json.JSONDecodeError, KeyError):
                 continue
 
+        self.ballot_counter = 0
+        self.num_acceptors = 3  # as specified in the requirements
+        self.quorum = (self.num_acceptors // 2) + 1
+
+        # Current proposal state
+        self.current_ballot = None
+        self.current_value = None
+        self.phase = None
+
+        # for phase 1
+        self.promises = {}
+
+        # for phase 2
+        self.accepted_count = 0
+
+        # The idea is to check if the number ofpromises with a ballot number,
+        # higher than the current one, are reaching the quorum,
+        # if so, we retry with a higher ballot number.
+
+        # By doing this we can avoid getting stuck in a situation where a proposer is waiting for promises.
+        # There could be the possibility to have a 'livelock' (both proposer keep interrupting each other)
+        # but it is very unlikely to happen (the value is decided pretty fast due to network latency)
+        # [information taken from "Paxos Made Live" [Chandra et al., 2007, Section 2.3]]
+        # N.B. : to implement liveness, we could instead implement a timeout.
+        self.ignored_promises = 0
+
     def run(self):
         logging.info(f"-> proposer {self.id}")
         while True:
-            # 1. Get next client value (from buffer or socket)
-            if self.pending_client_values:
-                original_value = self.pending_client_values.pop(0)
-            else:
-                msg, _ = self.client_r.recvfrom(2**16)
-                
-                try:
-                    # Ignore internal Paxos messages that other proposers are sending
-                    data = json.loads(msg.decode())
-                    if isinstance(data, dict) and 'type' in data:
-                        continue
-                except json.JSONDecodeError:
-                    pass # This is a client value
+            msg, addr = self.r.recvfrom(2**16)
+            logging.debug(f"Received {msg.decode()} from {addr}")
 
-                original_value = msg.decode().strip()
+            try:
+                # msg received is in tuple format (msg_type, *args)
+                decoded = decode_message(msg)
+                msg_type = decoded[0]
 
-            # 2. Persistently try to get this value decided.
-            my_value_decided = False
-            while not my_value_decided:
-                # CRITICAL: Before every attempt, sync with the global state.
-                self.sync_instance()
-                logging.info(f"Received '{original_value}'. Attempting to decide for instance {self.next_instance}.")
-
-                self.c_rnd += NUM_PROPOSERS
-                
-                # --- Phase 1: Prepare ---
-                promises = {}
-                prepare_msg = {'type': 'PREPARE', 'inst': self.next_instance, 'rnd': self.c_rnd}
-                self.s.sendto(json.dumps(prepare_msg).encode(), self.config["acceptors"])
-                
-                # Simplified wait loop for promises. A full implementation would use select here too.
-                # For this project, a blocking wait is acceptable as timeouts handle livelocks.
-                while len(promises) < self.majority:
-                    response, _ = self.client_r.recvfrom(2**16)
-                    try:
-                        data = json.loads(response.decode())
-                        if not isinstance(data, dict):
-                            # This is a client value - buffer it for later
-                            self.pending_client_values.append(response.decode().strip())
-                            continue
-                        if data.get('inst') == self.next_instance and data.get('type') == 'PROMISE' and data.get('rnd') == self.c_rnd:
-                            promises[data['aid']] = data
-                        elif data.get('rnd', data.get('v_rnd', 0)) > self.c_rnd:
-                            break # Preempted
-                    except (json.JSONDecodeError, KeyError):
-                        # Raw client value (not JSON) - buffer it
-                        self.pending_client_values.append(response.decode().strip())
-                        continue
-
-                if len(promises) < self.majority: continue # Restart round with higher number
-
-                # --- Phase 2: Propose ---
-                best_promise = max(promises.values(), key=lambda p: p['v_rnd'])
-                value_to_propose = original_value
-                if best_promise['v_rnd'] > 0:
-                    value_to_propose = best_promise['v_val']
-
-                acceptances = {}
-                propose_msg = {'type': 'PROPOSE', 'inst': self.next_instance, 'rnd': self.c_rnd, 'val': value_to_propose}
-                self.s.sendto(json.dumps(propose_msg).encode(), self.config["acceptors"])
-
-                while len(acceptances) < self.majority:
-                    response, _ = self.client_r.recvfrom(2**16)
-                    try:
-                        data = json.loads(response.decode())
-                        if not isinstance(data, dict):
-                            # This is a client value - buffer it for later
-                            self.pending_client_values.append(response.decode().strip())
-                            continue
-                        if data.get('inst') == self.next_instance and data.get('type') == 'ACCEPTED' and data.get('v_rnd') == self.c_rnd:
-                            acceptances[data['aid']] = data
-                        elif data.get('rnd', data.get('v_rnd', 0)) > self.c_rnd:
-                            break # Preempted
-                    except (json.JSONDecodeError, KeyError):
-                        # Raw client value (not JSON) - buffer it
-                        self.pending_client_values.append(response.decode().strip())
-                        continue
-                
-                if len(acceptances) < self.majority: continue # Restart round
-
-                # --- Phase 3: Decide ---
-                decision_msg = {'type': 'DECISION', 'inst': self.next_instance, 'val': value_to_propose}
-                logging.info(f"Decided instance {self.next_instance}: value '{value_to_propose}'")
-                self.s.sendto(json.dumps(decision_msg).encode(), self.config["learners"])
-                
-                # Increment next_instance since we just decided this one
-                self.next_instance += 1
-                
-                # Check if our original value was the one decided.
-                if value_to_propose == original_value:
-                    my_value_decided = True # Our mission is complete.
+                # Based on msg_type call the corresponding handler
+                if msg_type == "PROMISE":
+                    self.handle_promise(decoded)
+                elif msg_type == "ACCEPTED":
+                    self.handle_accepted(decoded)
                 else:
-                    # We helped another proposer. We must retry our value in the next instance.
-                    logging.warning(f"Helped decide '{value_to_propose}', but my value was '{original_value}'. Retrying.")
+                    # start new proposal
+                    self.handle_client_value(msg.decode())
+            except Exception as e:
+                logging.debug(f"Error processing message: {e}")
+
+    def handle_client_value(self, value):
+        """Set the value to propose and start Phase 1."""
+        logging.debug(f"Proposer {self.id}: received client value {value}")
+
+        # Start a new proposal
+        self.current_value = value
+        self.start_phase1()
+
+    def start_phase1(self):
+        """Phase1: send PREPARE to acceptors."""
+        # Generate the ballot number (it has to be unique)
+        self.current_ballot = self.ballot_counter * 100 + self.id
+        self.ballot_counter += 1
+
+        # Go to state PREPARE
+        self.phase = "PREPARE"
+        self.promises = {}
+        self.accepted_count = 0
+        self.ignored_promises = 0
+
+        prepare_msg = encode_message("PREPARE", self.current_ballot, self.id)
+
+        logging.debug(
+            f"Proposer {self.id}: starting Phase 1 with ballot {self.current_ballot}"
+        )
+        self.s.sendto(prepare_msg, self.config["acceptors"])
+
+    def handle_promise(self, msg):
+        """Handle the received PROMISE message from acceptor.
+        The 'msg' object has fields: (
+            msg_type(in this case "PROMISE", can be ignored),
+            ballot,
+            proposer_id,
+            accepted_ballot,
+            accepted_pid,
+            accepted_value,
+            acceptor_id)
+        """
+        (
+            _,
+            ballot,
+            proposer_id,
+            accepted_ballot,
+            accepted_pid,
+            accepted_value,
+            acceptor_id,
+        ) = msg
+
+        # If we get a promise with a higher ballot number, we retry with a higher value
+        if self.phase == "PREPARE" and ballot > self.current_ballot:
+            self.ignored_promises += 1
+            if self.ignored_promises >= self.quorum and self.current_value:
+                logging.debug(f"Proposer {self.id}: retrying with higher ballot.")
+                self.start_phase1()
+            return
+
+        # Ignore if not for our current proposal
+        if (
+            self.phase != "PREPARE"
+            or ballot != self.current_ballot
+            or proposer_id != self.id
+        ):
+            logging.debug(
+                f"Proposer {self.id}: ignoring PROMISE (not current proposal)"
+            )
+            return
+
+        logging.debug(
+            f"Proposer {self.id}: received PROMISE from acceptor {acceptor_id}"
+        )
+
+        # Store the promise in the proposer promises dictionary (need to take track of the highest accepted round)
+        self.promises[acceptor_id] = (accepted_ballot, accepted_pid, accepted_value)
+
+        # Check if we reached the quorum
+        if len(self.promises) >= self.quorum:
+            logging.debug(
+                f"Proposer {self.id}: received quorum of promises, starting Phase 2"
+            )
+            self.start_phase2()
+
+    def start_phase2(self):
+        """Phase 2: send ACCEPT to acceptors."""
+        self.phase = "ACCEPT"
+
+        # Select value: use the value from the highest accepted round, or our value
+        highest_rnd = (-1, -1)
+        selected_value = self.current_value
+
+        # Iterate over promises messages recived to find the highest accepted round
+        for acceptor_id, (acc_ballot, acc_pid, acc_value) in self.promises.items():
+            if acc_value is not None:
+                acc_rnd = (acc_ballot, acc_pid)
+                if RndGeq(acc_rnd, highest_rnd):
+                    highest_rnd = acc_rnd
+                    selected_value = acc_value
+
+        self.current_value = selected_value
+
+        accept_msg = encode_message(
+            "ACCEPT", self.current_ballot, self.id, self.current_value
+        )
+
+        logging.debug(
+            f"Proposer {self.id}: starting Phase 2 with value {self.current_value}"
+        )
+        self.s.sendto(accept_msg, self.config["acceptors"])
+
+    def handle_accepted(self, msg):
+        """Handle ACCEPTED message from acceptor with fields:
+        msg_type(in this case "ACCEPTED", can be ignored),
+        ballot,
+        proposer_id,
+        value,
+        acceptor_id
+        """
+        _, ballot, proposer_id, value, acceptor_id = msg
+
+        # Ignore if not for our current proposal
+        if (
+            self.phase != "ACCEPT"
+            or ballot != self.current_ballot
+            or proposer_id != self.id
+        ):
+            logging.debug(
+                f"Proposer {self.id}: ignoring ACCEPTED (not current proposal)"
+            )
+            return
+
+        logging.debug(
+            f"Proposer {self.id}: received ACCEPTED from acceptor {acceptor_id}"
+        )
+
+        self.accepted_count += 1
+
+        # Check if we have a quorum
+        if self.accepted_count >= self.quorum:
+            logging.debug(
+                f"Proposer {self.id}: quorum reached, sending DECISION to learners"
+            )
+
+            decision_msg = encode_message("DECISION", value)
+            self.s.sendto(decision_msg, self.config["learners"])
+
+            # Reset for future proposals...
+            self.phase = None
+            self.current_value = None

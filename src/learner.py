@@ -1,7 +1,7 @@
 import sys
 import logging
-import json
-from utils import mcast_receiver
+from utils import mcast_receiver, decode_message
+
 
 class Learner:
     def __init__(self, config, id):
@@ -11,26 +11,34 @@ class Learner:
         self.next_instance_to_print = 0
         self.buffer = {} # Buffer for out-of-order instances
 
+        # Track learned values with a set to avoid duplicates
+        self.learned = set()
+
     def run(self):
         logging.debug(f"-> learner {self.id}")
         while True:
             msg, addr = self.r.recvfrom(2**16)
-            try:
-                data = json.loads(msg.decode())
-                if data.get('type') != 'DECISION':
-                    continue
-                
-                inst = data['inst']
-                val = data['val']
-                
-                self.buffer[inst] = val
-                
-                # Print all consecutive learned values from the buffer
-                while self.next_instance_to_print in self.buffer:
-                    value_to_print = self.buffer.pop(self.next_instance_to_print)
-                    print(value_to_print)
-                    sys.stdout.flush()
-                    self.next_instance_to_print += 1
+            logging.debug(f"Received {msg.decode()} from {addr}")
 
-            except (json.JSONDecodeError, KeyError):
-                logging.debug(f"Received non-decision message: {msg.decode()}")
+            try:
+                decoded = decode_message(msg)
+                msg_type = decoded[0]
+
+                if msg_type == "DECISION":
+                    self.handle_decision(decoded)
+            except Exception as e:
+                logging.debug(f"Error processing message: {e}")
+
+    def handle_decision(self, msg):
+        """Handle DECISION message from proposer with fields:
+        msg_type(in this case "DECISION", can be ignored),
+        value
+        """
+        _, value = msg
+
+        # Print the decided value if we haven't already
+        if value not in self.learned:
+            self.learned.add(value)
+            logging.debug(f"Learner {self.id}: decided value {value}")
+            print(value)
+            sys.stdout.flush()

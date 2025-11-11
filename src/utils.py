@@ -34,3 +34,42 @@ def mcast_sender(ttl=1):
         socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, struct.pack("b", ttl)
     )
     return send_sock
+
+
+def RndGeq(rnd1, rnd2):
+    """Defines a total order over rounds. rnd : (ballot, proposer_id)"""
+    if rnd1[0] > rnd2[0]:
+        return True
+    elif rnd1[0] == rnd2[0] and rnd1[1] >= rnd2[1]:
+        return True
+    else:
+        return False
+
+
+def encode_message(msg_type, *args):
+    """Encode a Paxos message where the args are:
+    - msg_type: Type of message (PREPARE, PROMISE, ACCEPT, ACCEPTED, DECISION)
+    - *args: Message-specific arguments (ballot, proposer_id, value, etc.)
+    """
+    parts = [msg_type] + [str(arg) if arg is not None else "None" for arg in args]
+    return "|".join(parts).encode()
+
+
+def decode_message(msg_bytes):
+    """Decode a Paxos message from bytes to tuple"""
+    msg_str = msg_bytes.decode()
+    parts = msg_str.split("|")  # msg is in the format "msg_type|arg1|arg2|..."
+
+    # Convert numeric fields
+    converted_parts = [parts[0]]  # msg_type stays as string
+    for part in parts[1:]:
+        if part == "None":
+            converted_parts.append(None)
+        else:
+            # Try to convert to int
+            try:
+                converted_parts.append(int(part))
+            except ValueError:
+                converted_parts.append(part)
+
+    return tuple(converted_parts)

@@ -13,6 +13,9 @@ class Learner:
         # For in-order delivery
         self.next_instance_to_print = 0
         self.buffer = {}  # instance -> value (for out-of-order messages)
+        
+        # Track learned instances to prevent duplicates
+        self.learned_instances = set()  # Set of instances we've already learned
 
     def run(self):
         logging.debug(f"-> learner {self.id}")
@@ -20,53 +23,47 @@ class Learner:
             msg, addr = self.r.recvfrom(2**16)
             logging.debug(f"Received {msg.decode()} from {addr}")
 
-            try:
-                decoded = decode_message(msg)
-                
-                # Handle JSON format (MultiPaxos)
-                if isinstance(decoded, dict):
-                    if decoded.get('type') == 'DECISION':
-                        self.handle_decision_json(decoded)
-                    continue
-                
-                # Handle pipe-separated format (backward compatibility)
-                if isinstance(decoded, tuple):
-                    msg_type = decoded[0]
-                    if msg_type == "DECISION":
-                        self.handle_decision(decoded)
-            except Exception as e:
-                logging.debug(f"Error processing message: {e}")
+            decoded = decode_message(msg)
+            
+            # Handle JSON format (MultiPaxos)
+            if decoded.get('type') == 'DECISION':
+                self.handle_decision_json(decoded)
 
-    def handle_decision_json(self, msg):
-        """Handle DECISION message in JSON format for MultiPaxos"""
-        inst = msg.get('inst')
-        val = msg.get('val')
-        
-        if inst is None or val is None:
-            return
-        
-        # Buffer for out-of-order delivery
-        self.buffer[inst] = val
-        
-        # Deliver all consecutive values
+    def deliver_values(self):
+        """Deliver all consecutive values in order from buffer"""
         while self.next_instance_to_print in self.buffer:
             value_to_print = self.buffer.pop(self.next_instance_to_print)
             
-            # DELIVER: Output final value
+            # DELIVER: Output final value (only once per instance)
             logging.debug(f"Learner {self.id}: delivering instance {self.next_instance_to_print} = {value_to_print}")
             print(value_to_print)
             sys.stdout.flush()
             
             self.next_instance_to_print += 1
-
-    def handle_decision(self, msg):
-        """Handle DECISION message from proposer with fields:
-        msg_type(in this case "DECISION", can be ignored),
-        value
-        """
-        _, value = msg
-
-        # For backward compatibility (single instance), print immediately
-        logging.debug(f"Learner {self.id}: decided value {value}")
-        print(value)
-        sys.stdout.flush()
+    
+    def handle_decision_json(self, msg):
+        """Handle DECISION message in JSON format for MultiPaxos"""
+        inst = msg['inst']
+        val = msg['val']
+        
+        # Skip if already learned
+        if inst in self.learned_instances:
+            return
+        
+        # If this is the next expected instance, deliver immediately
+        if inst == self.next_instance_to_print:
+            logging.debug(f"Learner {self.id}: learned instance {inst} = '{val}' from DECISION (in order, delivering immediately)")
+            self.learned_instances.add(inst)
+            print(val)
+            sys.stdout.flush()
+            self.next_instance_to_print += 1
+            
+            # After delivering, check if we can deliver more from buffer
+            self.deliver_values()
+        else:
+            # Out of order: buffer it for later delivery
+            logging.debug(f"Learner {self.id}: learned instance {inst} = '{val}' from DECISION (out of order, buffering)")
+            self.buffer[inst] = val
+            self.learned_instances.add(inst)
+            # Try to deliver if this completes a sequence
+            self.deliver_values()

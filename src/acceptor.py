@@ -1,6 +1,6 @@
 import logging
 import json
-from utils import mcast_receiver, mcast_sender, decode_message, encode_message, RndGeq
+from utils import mcast_receiver, mcast_sender, decode_message
 
 
 class Acceptor:
@@ -10,10 +10,14 @@ class Acceptor:
         self.r = mcast_receiver(config["acceptors"])
         self.s = mcast_sender()
 
+        # ACCEPTORS ARE THE ONLY PERSISTENT STORE OF ACCEPTED VALUES
         # Per-instance state: instances[inst] = (rnd, v_rnd, v_val)
         # rnd: highest round promised
         # v_rnd: round of accepted value
         # v_val: accepted value
+        # This dictionary stores ALL accepted values for ALL instances.
+        # Proposers learn about accepted values ONLY through 1B (PROMISE) messages
+        # that include v_rnd and v_val from this store.
         self.instances = {}
 
     def run(self):
@@ -22,76 +26,57 @@ class Acceptor:
             msg, addr = self.r.recvfrom(2**16)
             logging.debug(f"Received {msg.decode()} from {addr}")
 
-            try:
-                decoded = decode_message(msg)
-                
-                # Handle JSON format (MultiPaxos)
-                if isinstance(decoded, dict):
-                    msg_type = decoded.get('type')
-                    inst = decoded.get('inst')
-                    
-                    if inst is None:
-                        continue  # Ignore messages without instance
-                    
-                    if msg_type == "PREPARE":
-                        self.handle_prepare_json(decoded)
-                    elif msg_type == "PROPOSE":
-                        self.handle_propose_json(decoded)
-                    continue
-                
-                # Handle pipe-separated format (backward compatibility)
-                msg_type = decoded[0] if isinstance(decoded, tuple) else None
-
-                if msg_type == "PREPARE":
-                    self.handle_prepare(decoded)
-                elif msg_type == "ACCEPT":
-                    self.handle_accept(decoded)
-            except Exception as e:
-                logging.debug(f"Error processing message: {e}")
+            decoded = decode_message(msg)
+            
+            # Handle JSON format (MultiPaxos)
+            msg_type = decoded.get('type')
+            inst = decoded.get('inst')
+            
+            if msg_type == "1A":
+                self.handle_prepare_json(decoded)
+            elif msg_type == "2A":
+                self.handle_propose_json(decoded)
 
     def handle_prepare_json(self, msg):
-        """Handle PREPARE message in JSON format for MultiPaxos"""
-        inst = msg.get('inst')
-        rnd_val = msg.get('rnd')
-        
-        if inst is None or rnd_val is None:
-            return
+        """Handle 1A (PREPARE) message in JSON format for MultiPaxos"""
+        inst = msg['inst']
+        rnd_val = msg['rnd']
         
         # Get state for this instance
         rnd, v_rnd, v_val = self.instances.get(inst, (0, 0, None))
         
-        logging.debug(f"Acceptor {self.id}: received PREPARE for inst={inst}, rnd={rnd_val}")
+        logging.debug(f"Acceptor {self.id}: received 1A (PREPARE) for inst={inst}, rnd={rnd_val}")
         
+        # If message has a higher round number, update the state and send a 1B (PROMISE) message to the proposer
         if rnd_val > rnd:
             rnd = rnd_val
+            # update acceptor state for current instance
             self.instances[inst] = (rnd, v_rnd, v_val)
             
             promise_msg = {
-                'type': 'PROMISE',
+                'type': '1B',
                 'inst': inst,
                 'rnd': rnd,
                 'v_rnd': v_rnd,
                 'v_val': v_val,
                 'aid': self.id
             }
-            logging.info(f"Acceptor {self.id}: sending PROMISE for inst={inst}, rnd={rnd}, v_rnd={v_rnd}")
+            logging.info(f"Acceptor {self.id}: sending 1B (PROMISE) for inst={inst}, rnd={rnd}, v_rnd={v_rnd}")
             self.s.sendto(json.dumps(promise_msg).encode(), self.config["proposers"])
         else:
-            logging.debug(f"Acceptor {self.id}: ignoring PREPARE for inst={inst}: rnd={rnd_val} <= {rnd}")
+            # Just ignore the message
+            logging.debug(f"Acceptor {self.id}: ignoring 1A (PREPARE) for inst={inst}: rnd={rnd_val} <= {rnd}")
     
     def handle_propose_json(self, msg):
-        """Handle PROPOSE message in JSON format for MultiPaxos"""
-        inst = msg.get('inst')
-        rnd_val = msg.get('rnd')
-        c_val = msg.get('val')
-        
-        if inst is None or rnd_val is None:
-            return
+        """Handle 2A (PROPOSE) message in JSON format for MultiPaxos"""
+        inst = msg['inst']
+        rnd_val = msg['rnd']
+        c_val = msg['val']
         
         # Get state for this instance
         rnd, v_rnd, v_val = self.instances.get(inst, (0, 0, None))
         
-        logging.debug(f"Acceptor {self.id}: received PROPOSE for inst={inst}, rnd={rnd_val}, val={c_val}")
+        logging.debug(f"Acceptor {self.id}: received 2A (PROPOSE) for inst={inst}, rnd={rnd_val}, val={c_val}")
         
         if rnd_val >= rnd:
             rnd = rnd_val
@@ -100,82 +85,14 @@ class Acceptor:
             self.instances[inst] = (rnd, v_rnd, v_val)
             
             accepted_msg = {
-                'type': 'ACCEPTED',
+                'type': '2B',
                 'inst': inst,
                 'v_rnd': v_rnd,
                 'v_val': v_val,
                 'aid': self.id
             }
-            logging.info(f"Acceptor {self.id}: sending ACCEPTED for inst={inst}, v_rnd={v_rnd}")
+            logging.info(f"Acceptor {self.id}: sending 2B (ACCEPTED) for inst={inst}, v_rnd={v_rnd}")
             self.s.sendto(json.dumps(accepted_msg).encode(), self.config["proposers"])
         else:
-            # Optional: send REJECT for fast preemption detection
-            reject_msg = {
-                'type': 'REJECT',
-                'inst': inst,
-                'rnd': rnd,
-                'aid': self.id
-            }
-            logging.debug(f"Acceptor {self.id}: rejecting PROPOSE for inst={inst}: rnd={rnd_val} < {rnd}")
-            self.s.sendto(json.dumps(reject_msg).encode(), self.config["proposers"])
-
-    def handle_prepare(self, msg):
-        """Handle PREPARE message from proposer with fields
-        msg_type(in this case "PREPARE", can be ignored),
-        ballot,
-        proposer_id,
-        """
-        _, ballot, proposer_id = msg
-        rnd = (ballot, proposer_id)
-
-        logging.debug(f"Acceptor {self.id}: received PREPARE {rnd}")
-
-        # If this round is greater than what we've promised, update and respond
-        if RndGeq(rnd, self.promised_rnd):
-            self.promised_rnd = rnd
-
-            # Send PROMISE with our accepted value (if any)
-            response = encode_message(
-                "PROMISE",
-                ballot,
-                proposer_id,
-                self.accepted_rnd[0],
-                self.accepted_rnd[1],
-                self.accepted_value,
-                self.id,
-            )
-
-            logging.debug(f"Acceptor {self.id}: sending PROMISE to proposers")
-            self.s.sendto(response, self.config["proposers"])
-        else:
-            logging.debug(
-                f"Acceptor {self.id}: ignoring PREPARE {rnd} (promised {self.promised_rnd})"
-            )
-
-    def handle_accept(self, msg):
-        """Handle ACCEPT message from proposer with fields:
-        msg_type(in this case "ACCEPT", can be ignored),
-        ballot,
-        proposer_id,
-        value,
-        """
-        _, ballot, proposer_id, value = msg
-        rnd = (ballot, proposer_id)
-
-        logging.debug(f"Acceptor {self.id}: received ACCEPT {rnd} with value {value}")
-
-        # If this round is >= what we've promised, accept it
-        if RndGeq(rnd, self.promised_rnd):
-            self.promised_rnd = rnd
-            self.accepted_rnd = rnd
-            self.accepted_value = value
-
-            # Send ACCEPTED to proposers (Phase 2B)
-            response = encode_message("ACCEPTED", ballot, proposer_id, value, self.id)
-
-            logging.debug(f"Acceptor {self.id}: sending ACCEPTED to proposers")
-            self.s.sendto(response, self.config["proposers"])
-        else:
-            logging.debug(
-                f"Acceptor {self.id}: ignoring ACCEPT {rnd} (promised {self.promised_rnd})"
-            )
+            # Just ignore the message (no REJECT message)
+            logging.debug(f"Acceptor {self.id}: ignoring 2A (PROPOSE) for inst={inst}: rnd={rnd_val} < {rnd}")

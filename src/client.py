@@ -23,11 +23,9 @@ class Client:
         for value in sys.stdin:
             value = value.strip()
             
-            # Generate unique ID
-            request_id = (self.id, self.seq_num)
             self.seq_num += 1
             
-            # Prepare JSON message with ID
+            # Pack the request information inside a JSON object to be sent to the proposers
             request_msg = {
                 'client_id': self.id,
                 'seq_num': self.seq_num - 1,
@@ -37,7 +35,8 @@ class Client:
             if self.measuring:
                 start_time = time.perf_counter()
 
-            logging.debug(f"client: sending {value} (id={request_id}) to proposers")
+            logging.debug(f"client: sending {value} to proposers")
+            # Value sent to all proposers
             self.s.sendto(json.dumps(request_msg).encode(), self.config["proposers"])
             
             # CLOSED LOOP: Wait for response

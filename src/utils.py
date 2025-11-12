@@ -64,3 +64,22 @@ def decode_message(msg_bytes):
                 converted_parts.append(part)
 
     return tuple(converted_parts)
+
+def RndGeq(rnd1, rnd2):
+    """
+    Compare two ballot/round numbers according to TLA+ specification.
+    Returns True if rnd1 >= rnd2 in the total order.
+    
+    Total order: rnd1.bal > rnd2.bal OR (rnd1.bal == rnd2.bal AND rnd1.pid >= rnd2.pid)
+    """
+    if rnd1 is None:
+        rnd1 = {'bal': 0, 'pid': 0}
+    if rnd2 is None:
+        rnd2 = {'bal': 0, 'pid': 0}
+    
+    if rnd1['bal'] > rnd2['bal']:
+        return True
+    elif rnd1['bal'] == rnd2['bal'] and rnd1['pid'] >= rnd2['pid']:
+        return True
+    else:
+        return False

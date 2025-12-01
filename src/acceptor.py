@@ -4,23 +4,60 @@ from utils import mcast_receiver, mcast_sender, decode_message, RndGeq
 
 
 class Acceptor:
+    """
+    Paxos Acceptor - The FAULT-TOLERANT component of the consensus protocol.
+    
+    Acceptors are the ONLY components that hold authoritative consensus state.
+    The safety of Paxos depends on the intersection property of majorities:
+    any two majorities share at least one acceptor, ensuring consistency.
+    
+    Each acceptor maintains per-instance state:
+    - rnd: highest round promised (will reject lower rounds)
+    - v_rnd: round of the last accepted value
+    - v_val: the last accepted value
+    
+    If up to floor((N-1)/2) acceptors crash, the remaining majority still
+    holds enough state to preserve safety and allow progress.
+    
+    Reference: Lamport, "Paxos Made Simple", 2001.
+    """
+    
     def __init__(self, config, id):
         self.config = config
         self.id = id
         self.r = mcast_receiver(config["acceptors"])
         self.s = mcast_sender()
 
-        # Per-instance state: instances[inst] = (rnd, v_rnd, v_val)
-        # rnd: highest round promised
-        # v_rnd: round of accepted value
-        # v_val: accepted value
-        # This dictionary stores ALL accepted values for ALL instances.
+        # =======================================================================
+        # CANONICAL PAXOS STATE (per-instance)
+        # =======================================================================
+        # This is the FAULT-TOLERANT state of the system.
+        # Acceptors are the only components that hold authoritative consensus state.
+        # Safety depends on majority intersection of acceptor states.
+        # Reference: Lamport, "Paxos Made Simple", 2001.
+        #
+        # Format: instances[inst] = (rnd, v_rnd, v_val)
+        #   - rnd:   highest round number promised (will not accept lower rounds)
+        #   - v_rnd: round number of the last accepted value (0 if none)
+        #   - v_val: the last accepted value (None if none)
+        #
         # Proposers learn about accepted values ONLY through 1B or 2B messages
         # that include v_rnd and v_val from this store.
+        # =======================================================================
         self.instances = {}
         
-        # Track all accepted values to send to proposers
-        self.accepted_values = {}  # {instance: value} - history of decided values
+        # =======================================================================
+        # LOCAL ACCEPTED HISTORY (for catch-up and debugging)
+        # =======================================================================
+        # IMPORTANT: This is the history of values THIS acceptor has accepted.
+        # It is NOT guaranteed to be the globally decided values.
+        # A value is globally decided only when a MAJORITY of acceptors have
+        # accepted it for the same instance.
+        #
+        # This history is sent to proposers in 1B/2B messages as a hint.
+        # Proposers should NOT treat this as authoritative "decided" state.
+        # =======================================================================
+        self.accepted_values = {}  # {instance: value}
 
     def run(self):
         logging.info(f"-> acceptor {self.id}")
@@ -37,6 +74,8 @@ class Acceptor:
                 self.handle_prepare(decoded)
             elif msg_type == "2A":
                 self.handle_propose(decoded)
+            elif msg_type == "CATCHUP_REQUEST":
+                self.handle_catchup_request(decoded)
 
     def handle_prepare(self, msg):
         inst = msg['inst']
@@ -100,3 +139,25 @@ class Acceptor:
         else:
             # Just ignore the message (no REJECT message)
             pass
+
+    def handle_catchup_request(self, msg):
+        """
+        Handle catch-up request from a late-joining learner.
+        
+        Learners that start late need to reconstruct the decided sequence.
+        Since acceptors are the FAULT-TOLERANT component, learners query
+        acceptors for their accepted_values history.
+        
+        The learner will aggregate responses from multiple acceptors and
+        treat a value as decided only if a MAJORITY of acceptors report it.
+        """
+        lid = msg.get('lid', 'unknown')
+        logging.info(f"Acceptor {self.id}: received CATCHUP_REQUEST from learner {lid}")
+        
+        response = {
+            'type': 'CATCHUP_RESPONSE',
+            'aid': self.id,
+            'accepted_values': self.accepted_values
+        }
+        logging.info(f"Acceptor {self.id}: sending CATCHUP_RESPONSE with {len(self.accepted_values)} instances")
+        self.s.sendto(json.dumps(response).encode(), self.config["learners"])

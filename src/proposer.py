@@ -6,93 +6,195 @@ from utils import mcast_receiver, mcast_sender, RndGeq
 
 
 class Proposer:
+    """
+    Paxos Proposer - Coordinator role in the consensus protocol.
+    
+    IMPORTANT: Proposers are NOT the fault-tolerant state holders.
+    They are ephemeral coordinators that drive the protocol.
+    The authoritative consensus state lives in the ACCEPTORS.
+    
+    If a proposer crashes, another proposer can continue from acceptor state.
+    Reference: Lamport, "Paxos Made Simple", 2001.
+    """
+    
     def __init__(self, config, id):
         self.config = config
         self.id = id
         self.client_r = mcast_receiver(config["proposers"])
         self.s = mcast_sender()
 
+        # Number of acceptors and majority threshold for quorum
         self.num_acceptors = 3  # as specified in the requirements
         self.majority = (self.num_acceptors // 2) + 1
 
-        # Proposal number (avoids collisions between proposers)
+        # =======================================================================
+        # ROUND COUNTER
+        # =======================================================================
+        # Used to generate unique, monotonically increasing proposal numbers.
+        # Combined with proposer id to avoid collisions: c_rnd = {bal, pid}
+        # =======================================================================
         self.round_counter = 0
 
-        # keep track of the instance number that needs to be proposed.
+        # =======================================================================
+        # INSTANCE TRACKING
+        # =======================================================================
+        # The next instance number to propose for.
+        # Instances are decided in order: 0, 1, 2, ...
+        # A proposer only advances to instance N+1 after instance N is decided.
+        # =======================================================================
         self.next_instance = 0
 
-        # Buffer for client values during Paxos message processing
-        # We decided to have a buffer for client value to not lose value if 
-        # proposer is still trying to decide the value but during the process new values are received.
+        # =======================================================================
+        # CLIENT VALUE BUFFER
+        # =======================================================================
+        # Buffer for client values received during Paxos message processing.
+        # This prevents losing values if new client requests arrive while
+        # the proposer is still running a Paxos round.
+        # =======================================================================
         self.pending_client_values = []
         
-        # Track values we've learned were already decided to avoid duplicates
-        self.known_decided_values = set()
+        # =======================================================================
+        # LOCAL DECISION VIEW (soft state, non-authoritative)
+        # =======================================================================
+        # Tracks which instances this proposer has seen decided.
+        # This is a LOCAL VIEW, not the authoritative state.
+        # The authoritative state is in the acceptors.
+        # Used for logging and local bookkeeping only.
+        # =======================================================================
+        self.decided_instances = {}  # inst -> decided_value
+        
+        # =======================================================================
+        # ACCEPTED HISTORY (hints from acceptors, NOT decisions)
+        # =======================================================================
+        # Values observed as accepted by some acceptor.
+        # IMPORTANT: These are NOT guaranteed to be globally decided.
+        # A single acceptor's accept is just a vote, not a decision.
+        # Used for debugging/logging only, NOT for control flow.
+        # =======================================================================
+        self.accepted_history = {}  # inst -> value (hints only)
 
     def run(self):
+        """
+        Main loop: receive client values and run Paxos to decide them.
+        
+        For each client value:
+        1. Run Paxos on the current instance until some value is decided.
+        2. If our value was decided, move to next client request.
+        3. If a different value was decided (due to prior acceptor state),
+           advance to the next instance and retry our value there.
+        
+        IMPORTANT: We do NOT skip client values based on "already seen" heuristics.
+        Every client request is processed through Paxos to guarantee integrity.
+        Reference: Cachin et al., "Introduction to Reliable and Secure
+                   Distributed Programming", Ch. 3 (atomic broadcast).
+        """
         logging.info(f"-> proposer {self.id}")
         
         while True:
-            # get next value from client
+            # ===================================================================
+            # GET NEXT CLIENT VALUE
+            # ===================================================================
             if self.pending_client_values:
+                # Process buffered values first (received during Paxos rounds)
                 msg_data = self.pending_client_values.pop(0)
             else:
+                # Wait for new client request
                 msg, _ = self.client_r.recvfrom(2**16)
                 data = json.loads(msg.decode())
                  
-                # To update the proposer state correctly we rely on run_full_paxos function
+                # Ignore Paxos protocol messages at the top level.
+                # These are handled inside run_full_paxos.
                 if data.get('type') in ['1B', '2B', 'DECISION']:
                     continue
                 
                 msg_data = data
             
-            # Extract value
+            # Extract the value to propose
             value = msg_data.get('value')
             
-            # Skip if this value was already decided
-            if value in self.known_decided_values:
-                pass
-                continue
-            
-            # Proposers do NOT maintain persistent state about past proposals.
-            # All information about accepted values comes from acceptors via 1B messages.
-            
-            # Loop until this value is decided
+            # ===================================================================
+            # RUN PAXOS UNTIL THIS VALUE IS DECIDED
+            # ===================================================================
+            # We keep trying until our value is chosen at some instance.
+            # If a different value is chosen (due to prior acceptor state),
+            # we advance to the next instance and retry.
+            # ===================================================================
             decided = False
             while not decided:
-                # Run Paxos on the current instance
                 success, decided_value = self.run_full_paxos(value)
                 
                 if success:
-                    # Mark decided value as known
-                    self.known_decided_values.add(decided_value)
+                    # Record decision in our local view (soft state)
+                    self.decided_instances[self.next_instance] = decided_value
                     
                     if decided_value == value:
-                        # Our value was decided
+                        # Our value was decided at this instance
                         decided = True
                         logging.info(f"Value '{value}' decided at instance {self.next_instance}")
                     else:
-                        # Different value decided, will retry at next instance
-                        pass
+                        # A different value was decided (from prior acceptor state).
+                        # This preserves safety: we adopt what was already chosen.
+                        # Our value will be retried at the next instance.
+                        logging.info(f"Instance {self.next_instance} decided with different value '{decided_value}', retrying our value at next instance")
                     
+                    # Advance to next instance (this one is now closed)
                     self.next_instance += 1
                 else:
-                    pass
+                    # Paxos round failed (timeout or preemption).
+                    # Stay on the same instance and retry with a higher round.
+                    logging.debug(f"Paxos round failed for instance {self.next_instance}, retrying")
 
     def _extract_accepted_history(self, data):
+        """
+        Extract accepted values history from acceptor messages (1B/2B).
+        
+        IMPORTANT: This is for DEBUGGING and LOGGING only.
+        The values in 'accepted_values' are what a single acceptor has accepted.
+        They are NOT guaranteed to be globally decided values.
+        
+        A value is globally decided only when a MAJORITY of acceptors have
+        accepted it. We cannot infer that from a single acceptor's history.
+        
+        Therefore, we store this in accepted_history (hints) and do NOT use
+        it to skip client requests or make control flow decisions.
+        """
         if 'accepted_values' in data:
             for inst_num, val in data['accepted_values'].items():
                 inst_num = int(inst_num)
-                if val not in self.known_decided_values:
-                    logging.info(f"Learned value '{val}' was accepted at instance {inst_num}")
-                    self.known_decided_values.add(val)
+                # Only log if we haven't seen this instance before
+                if inst_num not in self.accepted_history:
+                    logging.debug(f"Hint from acceptor: instance {inst_num} has accepted value '{val}'")
+                # Store as hint (may be overwritten by later messages)
+                self.accepted_history[inst_num] = val
 
     def run_full_paxos(self, original_value):
+        """
+        Run a complete Paxos round (Phase 1 + Phase 2) for the current instance.
+        
+        Args:
+            original_value: The value we want to propose.
+        
+        Returns:
+            (True, decided_value): If a value was decided for this instance.
+                                   decided_value may differ from original_value
+                                   if acceptors had prior accepted state.
+            (False, None): If the round failed (timeout or preemption).
+        
+        The Paxos safety rule:
+        - In Phase 1, we learn what values acceptors have already accepted.
+        - If any acceptor has accepted a value, we MUST propose that value
+          (the one with the highest v_rnd) to preserve safety.
+        - Only if no acceptor has accepted anything can we propose our own value.
+        
+        Reference: Lamport, "Paxos Made Simple", 2001.
+        """
         self.round_counter += 1
         self.c_rnd = {'bal': self.round_counter, 'pid': self.id} 
         logging.info(f"Running Paxos for instance {self.next_instance} with round {self.c_rnd}")
         
-        # HASE 1: (1A)
+        # ===================================================================
+        # PHASE 1: PREPARE (1A) and collect PROMISE (1B)
+        # ===================================================================
         prepare_msg = {
             'type': '1A',
             'inst': self.next_instance,
@@ -150,19 +252,31 @@ class Proposer:
         
         logging.info(f"Phase 1 complete for instance {self.next_instance}")
         
-        # Determine value to propose using RndGeq
+        # ===================================================================
+        # VALUE SELECTION (Paxos safety rule)
+        # ===================================================================
+        # We MUST propose the value with the highest v_rnd among all promises.
+        # This ensures we don't overwrite a value that may have been chosen.
+        # Only if no acceptor has accepted anything (all v_rnd = 0) can we
+        # propose our original_value.
+        # ===================================================================
         max_v_rnd = {'bal': 0, 'pid': 0}
         value_to_propose = original_value
         
-        # Find the highest v_rnd among promises
         for promise in promises.values():
             v_rnd = promise.get('v_rnd', {'bal': 0, 'pid': 0})
             if RndGeq(v_rnd, max_v_rnd):
                 max_v_rnd = v_rnd
                 if v_rnd.get('bal', 0) > 0:
+                    # Adopt the value from the highest round
                     value_to_propose = promise.get('v_val')
         
-        # PHASE 2: (2A)
+        if value_to_propose != original_value:
+            logging.info(f"Adopting previously accepted value '{value_to_propose}' (from round {max_v_rnd})")
+        
+        # ===================================================================
+        # PHASE 2: PROPOSE (2A) and collect ACCEPTED (2B)
+        # ===================================================================
         propose_msg = {
             'type': '2A',
             'inst': self.next_instance,
@@ -211,7 +325,15 @@ class Proposer:
                         logging.warning(f"Preempted in Phase 2 by round {received_v_rnd}")
                         return (False, None)
         
-        # DECIDE
+        # ===================================================================
+        # DECISION: Value is now chosen for this instance
+        # ===================================================================
+        # A majority of acceptors have accepted (inst, c_rnd, value_to_propose).
+        # By Paxos safety, this value is now the unique decided value for
+        # this instance. No other value can ever be decided for this instance.
+        #
+        # We notify learners so they can deliver the value.
+        # ===================================================================
         decision_msg = {
             'type': 'DECISION',
             'inst': self.next_instance,

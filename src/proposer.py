@@ -326,21 +326,16 @@ class Proposer:
                         return (False, None)
         
         # ===================================================================
-        # DECISION: Value is now chosen for this instance
+        # DECISION REACHED
         # ===================================================================
         # A majority of acceptors have accepted (inst, c_rnd, value_to_propose).
         # By Paxos safety, this value is now the unique decided value for
         # this instance. No other value can ever be decided for this instance.
         #
-        # We notify learners so they can deliver the value.
+        # Note: We do NOT send a separate DECISION message to learners.
+        # Learners receive 2B directly from acceptors and decide when they
+        # see a majority (Optimization 1: direct learning from acceptors).
         # ===================================================================
-        decision_msg = {
-            'type': 'DECISION',
-            'inst': self.next_instance,
-            'val': value_to_propose
-        }
-        self.s.sendto(json.dumps(decision_msg).encode(), self.config["learners"])
-        
         logging.info(f"DECIDED instance {self.next_instance} = '{value_to_propose}'")
         
         return (True, value_to_propose)

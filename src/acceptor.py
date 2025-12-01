@@ -135,7 +135,12 @@ class Acceptor:
                 'accepted_values': self.accepted_values
             }
             logging.info(f"Acceptor {self.id}: sending 2B (ACCEPTED) for inst={inst}, v_rnd={v_rnd}")
+            
+            # Send 2B to proposers (for Phase 2 completion)
             self.s.sendto(json.dumps(accepted_msg).encode(), self.config["proposers"])
+            
+            # Send 2B to learners (Optimization 1: learners decide from majority of 2B)
+            self.s.sendto(json.dumps(accepted_msg).encode(), self.config["learners"])
         else:
             # Just ignore the message (no REJECT message)
             pass

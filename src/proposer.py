@@ -72,6 +72,16 @@ class Proposer:
         # Used for debugging/logging only, NOT for control flow.
         # =======================================================================
         self.accepted_history = {}  # inst -> value (hints only)
+        
+        # =======================================================================
+        # PRE-PHASE1 STATE (Optimization 2)
+        # =======================================================================
+        # Run Phase 1 early (before client value arrives) and reuse the result.
+        # This reduces latency when we already have a prepared instance.
+        # =======================================================================
+        self.prepared_instance = None   # instance number
+        self.prepared_round = None      # c_rnd for that instance
+        self.prepared_promises = None   # dict[aid] -> 1B message
 
     def run(self):
         """
@@ -83,6 +93,11 @@ class Proposer:
         3. If a different value was decided (due to prior acceptor state),
            advance to the next instance and retry our value there.
         
+        Optimization 2: Pre-Phase1
+        Before waiting for a client value, we try to run Phase 1 for the
+        next instance. This way, when a value arrives, we can skip Phase 1
+        and go directly to value selection + Phase 2.
+        
         IMPORTANT: We do NOT skip client values based on "already seen" heuristics.
         Every client request is processed through Paxos to guarantee integrity.
         Reference: Cachin et al., "Introduction to Reliable and Secure
@@ -91,6 +106,22 @@ class Proposer:
         logging.info(f"-> proposer {self.id}")
         
         while True:
+            # ===================================================================
+            # PRE-PHASE1: Prepare next instance while idle (Optimization 2)
+            # ===================================================================
+            if not self.pending_client_values:
+                if (self.prepared_instance != self.next_instance or
+                    self.prepared_promises is None):
+                    # Try to prepare the next instance
+                    next_round = {'bal': self.round_counter + 1, 'pid': self.id}
+                    ok, promises = self._run_phase1(self.next_instance, next_round)
+                    if ok:
+                        self.round_counter += 1
+                        self.prepared_instance = self.next_instance
+                        self.prepared_round = next_round
+                        self.prepared_promises = promises
+                        logging.debug(f"Pre-Phase1 complete for instance {self.next_instance}")
+            
             # ===================================================================
             # GET NEXT CLIENT VALUE
             # ===================================================================
@@ -167,6 +198,67 @@ class Proposer:
                 # Store as hint (may be overwritten by later messages)
                 self.accepted_history[inst_num] = val
 
+    def _run_phase1(self, inst, c_rnd):
+        """
+        Run Phase 1 (PREPARE/PROMISE) for given instance and round.
+        
+        Returns:
+            (True, promises_dict): Majority of 1B with matching rnd
+            (False, None): Timeout or preemption
+        """
+        prepare_msg = {
+            'type': '1A',
+            'inst': inst,
+            'rnd': c_rnd
+        }
+        self.s.sendto(json.dumps(prepare_msg).encode(), self.config["acceptors"])
+        
+        promises = {}
+        timeout = 0.25
+        start_time = time.time()
+        
+        while len(promises) < self.majority:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                logging.debug(f"Phase 1 timeout for instance {inst}")
+                return (False, None)
+            
+            remaining_time = timeout - elapsed
+            select_timeout = min(0.1, remaining_time)
+            ready, _, _ = select.select([self.client_r], [], [], select_timeout)
+            if not ready:
+                continue
+            
+            for sock in ready:
+                response, _ = sock.recvfrom(2**16)
+                data = json.loads(response.decode())
+                
+                # Buffer client values
+                if 'type' not in data:
+                    self.pending_client_values.append(data)
+                    continue
+                
+                if (data.get('inst') == inst and 
+                    data.get('type') == '1B' and 
+                    data.get('rnd') == c_rnd):
+                    self._extract_accepted_history(data)
+                    aid = data.get('aid', len(promises))
+                    promises[aid] = data
+                    
+                elif data.get('type') == '1B' and data.get('inst') == inst:
+                    received_rnd = data.get('rnd')
+                    if received_rnd and RndGeq(received_rnd, c_rnd) and received_rnd != c_rnd:
+                        logging.debug(f"Preempted in Phase 1 by round {received_rnd}")
+                        return (False, None)
+        
+        return (True, promises)
+
+    def _clear_prepared(self):
+        """Clear prepared Phase 1 state."""
+        self.prepared_instance = None
+        self.prepared_round = None
+        self.prepared_promises = None
+
     def run_full_paxos(self, original_value):
         """
         Run a complete Paxos round (Phase 1 + Phase 2) for the current instance.
@@ -188,69 +280,31 @@ class Proposer:
         
         Reference: Lamport, "Paxos Made Simple", 2001.
         """
-        self.round_counter += 1
-        self.c_rnd = {'bal': self.round_counter, 'pid': self.id} 
-        logging.info(f"Running Paxos for instance {self.next_instance} with round {self.c_rnd}")
+        inst = self.next_instance
         
         # ===================================================================
-        # PHASE 1: PREPARE (1A) and collect PROMISE (1B)
+        # PHASE 1: Reuse prepared or run fresh (Optimization 2)
         # ===================================================================
-        prepare_msg = {
-            'type': '1A',
-            'inst': self.next_instance,
-            'rnd': self.c_rnd
-        }
-        self.s.sendto(json.dumps(prepare_msg).encode(), self.config["acceptors"])
-        
-        promises = {}
-        timeout = 0.25
-        start_time = time.time()
-        
-        while len(promises) < self.majority:
-
-            #=================TIMEOUT HANDLING WITH SELECT()=================
-            # This need to be analyzed better, at the moment we use this approach:
-            # source: https://stackoverflow.com/questions/19410651/how-to-use-select-when-network-socket-is-always-ready-to-read
-            # https://stackoverflow.com/questions/12625224/how-is-select-alerted-to-an-fd-becoming-ready
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                logging.warning(f"Phase 1 timeout - {len(promises)}/{self.majority} promises")
-                return (False, None)
+        if (self.prepared_instance == inst and
+            self.prepared_round is not None and
+            self.prepared_promises is not None):
+            # Reuse prepared Phase 1
+            self.c_rnd = self.prepared_round
+            promises = self.prepared_promises
+            logging.info(f"Reusing prepared Phase 1 for instance {inst} with round {self.c_rnd}")
+        else:
+            # Run fresh Phase 1
+            self.round_counter += 1
+            self.c_rnd = {'bal': self.round_counter, 'pid': self.id}
+            logging.info(f"Running fresh Phase 1 for instance {inst} with round {self.c_rnd}")
             
-            remaining_time = timeout - elapsed
-            select_timeout = min(0.1, remaining_time)
-            ready, _, _ = select.select([self.client_r], [], [], select_timeout)
-            if not ready:
-                continue
-            #=================TIMEOUT HANDLING WITH SELECT()=================
-
-            # So, if the socket is ready we can read from it
-            # (ready contains sockets with data to read)
-            for sock in ready:
-                response, _ = sock.recvfrom(2**16)
-                data = json.loads(response.decode())
-                
-                # If doesn't have type, it's a client value to buffer
-                if 'type' not in data:
-                    self.pending_client_values.append(data)
-                    continue
-                
-                if (data.get('inst') == self.next_instance and 
-                    data.get('type') == '1B' and 
-                    data.get('rnd') == self.c_rnd):
-                    
-                    # Extract accepted values history from the promise 
-                    self._extract_accepted_history(data)
-                    aid = data.get('aid', len(promises))
-                    promises[aid] = data
-                    
-                elif data.get('type') == '1B' and data.get('inst') == self.next_instance:
-                    received_rnd = data.get('rnd')
-                    if received_rnd and RndGeq(received_rnd, self.c_rnd) and received_rnd != self.c_rnd:
-                        logging.warning(f"Preempted in Phase 1 by round {received_rnd}")
-                        return (False, None)
+            ok, promises = self._run_phase1(inst, self.c_rnd)
+            if not ok:
+                self._clear_prepared()
+                return (False, None)
         
-        logging.info(f"Phase 1 complete for instance {self.next_instance}")
+        # Clear prepared state (will be used or was just used)
+        self._clear_prepared()
         
         # ===================================================================
         # VALUE SELECTION (Paxos safety rule)

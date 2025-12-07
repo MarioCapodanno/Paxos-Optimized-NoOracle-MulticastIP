@@ -83,6 +83,13 @@ class Proposer:
         self.prepared_round = None      # c_rnd for that instance
         self.prepared_promises = None   # dict[aid] -> 1B message
 
+        # =======================================================================
+        # BATCHING CONFIGURATION
+        # =======================================================================
+        self.BATCH_SIZE = 10        # Max number of requests per batch
+        self.BATCH_TIMEOUT = 0.05   # Max wait time (seconds) to fill a batch
+        # =======================================================================
+
     def run(self):
         """
         Main loop: receive client values and run Paxos to decide them.
@@ -121,27 +128,71 @@ class Proposer:
                         self.prepared_round = next_round
                         self.prepared_promises = promises
                         logging.debug(f"Pre-Phase1 complete for instance {self.next_instance}")
-            
+
             # ===================================================================
-            # GET NEXT CLIENT VALUE
+            # ACCUMULATE BATCH (Optimization 3)
             # ===================================================================
-            if self.pending_client_values:
-                # Process buffered values first (received during Paxos rounds)
+            current_batch = []
+            batch_start_time = None
+
+            # 1. Pre-fill batch from buffered client values
+            while self.pending_client_values and len(current_batch) < self.BATCH_SIZE:
                 msg_data = self.pending_client_values.pop(0)
-            else:
-                # Wait for new client request
-                msg, _ = self.client_r.recvfrom(2**16)
-                data = json.loads(msg.decode())
-                 
-                # Ignore Paxos protocol messages at the top level.
-                # These are handled inside run_full_paxos.
-                if data.get('type') in ['1B', '2B', 'DECISION']:
-                    continue
-                
-                msg_data = data
+                current_batch.append(msg_data['value'])
             
-            # Extract the value to propose
-            value = msg_data.get('value')
+            # If we took something from the buffer, start the timer now
+            if current_batch:
+                batch_start_time = time.time()
+
+            # 2. If the batch is not full, listen to the network (with timeout)
+            while len(current_batch) < self.BATCH_SIZE:
+                
+                # Calculate how much time we have left to wait
+                wait_time = None # Default: infinite wait (if the batch is empty)
+                
+                if current_batch:
+                    elapsed = time.time() - batch_start_time
+                    if elapsed >= self.BATCH_TIMEOUT:
+                        # Timeout reached! Stop waiting and propose what we have
+                        logging.debug("Batch timeout reached")
+                        break
+                    wait_time = self.BATCH_TIMEOUT - elapsed
+
+                # Use select to avoid blocking indefinitely if we have a timeout
+                # If wait_time is None, block until the first message arrives
+                ready, _, _ = select.select([self.client_r], [], [], wait_time)
+                
+                if not ready:
+                    # Select timeout expired, exit the loop and propose what we have
+                    break
+
+                # There is a message ready to be read
+                try:
+                    msg, _ = self.client_r.recvfrom(2**16)
+                    data = json.loads(msg.decode())
+                    
+                    # Ignore Paxos protocol messages (noise on the channel)
+                    if data.get('type') in ['1B', '2B', 'DECISION']:
+                        continue
+                    
+                    # This is a valid Client message!
+                    current_batch.append(data['value'])
+                    
+                    # If this was the first element, start the timer now
+                    if batch_start_time is None:
+                        batch_start_time = time.time()
+                        
+                except Exception as e:
+                    logging.debug(f"Error decoding message in batch loop: {e}")
+                    continue
+
+            # ===================================================================
+            # PREPARE VALUE TO PROPOSE
+            # ===================================================================
+            # Ora 'value' non è più una stringa singola, ma una LISTA di stringhe
+            value = current_batch
+            
+            logging.info(f"Proposing batch of size {len(value)} for instance {self.next_instance}")
             
             # ===================================================================
             # RUN PAXOS UNTIL THIS VALUE IS DECIDED

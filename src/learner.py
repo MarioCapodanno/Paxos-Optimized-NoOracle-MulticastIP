@@ -139,11 +139,21 @@ class Learner:
                 continue
             
             value_to_print = self.buffer.pop(curr_inst)
+            self.delivered_instances.add(curr_inst)
             
             # output the current instance value
             logging.debug(f"Learner {self.id}: delivering instance {curr_inst} = {value_to_print}")
-            self.delivered_instances.add(curr_inst)
-            print(value_to_print)
+
+            # === FIX FOR BATCHING ===
+            # Check if it is a container (List or Tuple) or a single value
+            if isinstance(value_to_print, (list, tuple)):
+                # It is a Batch! Iterate and print one by one
+                for item in value_to_print:
+                    print(item)
+            else:
+                # It is a single value (old version)
+                print(value_to_print)
+
             sys.stdout.flush()
             
             self.next += 1
@@ -156,8 +166,15 @@ class Learner:
         send 2B for the same (inst, val), the value is decided.
         """
         inst = msg['inst']
-        val = msg['v_val']
+        raw_val = msg['v_val']
         aid = msg['aid']
+        
+        # FIX FOR BATCHING: Convert the list to a tuple to use as a dict key
+        # If raw_val is a list, convert it to a tuple. If it's a string, leave it as is.
+        if isinstance(raw_val, list):
+            val = tuple(raw_val)
+        else:
+            val = raw_val
         
         # Skip if already decided
         if inst in self.delivered_instances or inst in self.buffer:
@@ -197,8 +214,15 @@ class Learner:
         
         logging.debug(f"Learner {self.id}: received CATCHUP_RESPONSE from acceptor {aid} with {len(accepted_values)} instances")
         
-        for inst_str, val in accepted_values.items():
+        for inst_str, raw_val in accepted_values.items():
             inst = int(inst_str)
+
+            # === FIX FOR BATCHING ===
+            # If raw_val is a list (batch), convert it to a tuple to use as a dict key
+            if isinstance(raw_val, list):
+                val = tuple(raw_val)
+            else:
+                val = raw_val
             
             # Skip if already delivered or buffered
             if inst in self.delivered_instances or inst in self.buffer:
@@ -220,31 +244,23 @@ class Learner:
                 self._deliver_value(inst, val, source="catch-up")
 
     def _deliver_value(self, inst, val, source="DECISION"):
-        """
-        Common delivery logic for both DECISION messages and catch-up.
-        
-        Handles in-order delivery: if inst == self.next, deliver immediately;
-        otherwise buffer for later delivery.
-        """
-        # Skip if already delivered or buffered
-        if inst in self.delivered_instances or inst in self.buffer:
-            return
-        
-        if inst == self.next:
-            # Deliver immediately if in order
-            self.delivered_instances.add(inst)
-            logging.debug(f"Learner {self.id}: delivering instance {inst} = '{val}' ({source})")
-            print(val)
-            sys.stdout.flush()
-            self.next += 1
+            """
+            Common delivery logic.
+            Simplification: We let deliver_values() handle the unpacking and printing
+            to avoid code duplication.
+            """
+            # Skip if already delivered or buffered
+            if inst in self.delivered_instances or inst in self.buffer:
+                return
             
-            # Check if we can deliver more from buffer
-            self.deliver_values()
-        else:
-            # Out of order: buffer it
+            # Put always in the buffer, even if it is in order.
+            # deliver_values() is smart enough to take it immediately
+            # and print it correctly (handling batching).
             self.buffer[inst] = val
-            logging.debug(f"Learner {self.id}: buffered instance {inst} = '{val}' ({source}, expected next={self.next})")
-            # Try to deliver if this completes a sequence
+            
+            logging.debug(f"Learner {self.id}: received inst {inst}, handing over to delivery loop")
+            
+            # Call the delivery engine
             self.deliver_values()
 
     def _request_catchup_if_needed(self):

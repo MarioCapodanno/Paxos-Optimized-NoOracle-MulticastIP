@@ -96,6 +96,9 @@ class Learner:
         # =======================================================================
         self.catchup_votes = {}  # inst -> {val: count}
         self.last_catchup_time = 0
+        
+        # (No value-level deduplication here; learners print exactly
+        # the decided sequence delivered by Paxos.)
 
     def run(self):
         """
@@ -117,16 +120,28 @@ class Learner:
         # ===================================================================
         
         while True:
-            msg, addr = self.r.recvfrom(2**16)
-            logging.debug(f"Received {msg.decode()} from {addr}")
-
-            decoded = decode_message(msg)
-            msg_type = decoded.get('type')
+            # Check for messages with a timeout
+            # We wait up to 0.1 seconds for a message.
+            # If no message arrives, we can do other maintenance tasks (like catch-up).
+            import select
+            ready, _, _ = select.select([self.r], [], [], 0.25)
             
-            if msg_type == '2B':
-                self.handle_2B(decoded)
-            elif msg_type == 'CATCHUP_RESPONSE':
-                self.handle_catchup_response(decoded)
+            if ready:
+                # We have a message to read
+                msg, addr = self.r.recvfrom(2**16)
+                logging.debug(f"Received {msg.decode()} from {addr}")
+
+                decoded = decode_message(msg)
+                msg_type = decoded.get('type')
+                
+                if msg_type == '2B':
+                    self.handle_2B(decoded)
+                elif msg_type == 'CATCHUP_RESPONSE':
+                    self.handle_catchup_response(decoded)
+            
+            # Maintenance: Check if we need to request catch-up
+            # This runs on every loop iteration (either after processing a message or after timeout)
+            self._request_catchup_if_needed()
 
     def deliver_values(self):
         while self.next in self.buffer:

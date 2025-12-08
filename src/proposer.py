@@ -25,7 +25,7 @@ class Proposer:
         self.s = mcast_sender()
 
         # Number of acceptors and majority threshold for quorum
-        self.num_acceptors = 3  # as specified in the requirements
+        self.num_acceptors = 3  # Must match NUM_ACCEPTORS in run.sh
         self.majority = (self.num_acceptors // 2) + 1
 
         # =======================================================================
@@ -87,9 +87,28 @@ class Proposer:
         # =======================================================================
         # BATCHING CONFIGURATION
         # =======================================================================
-        self.BATCH_SIZE = 50        # Max number of requests per batch
-        self.BATCH_TIMEOUT = 0.005   # Max wait time (seconds) to fill a batch
+        self.BATCH_SIZE = 5         # Max number of requests per batch
+        self.BATCH_TIMEOUT = 0.5    # Max wait time (seconds) to fill a batch
         # =======================================================================
+        
+        # =======================================================================
+        # REQUEST ID DEDUPLICATION
+        # =======================================================================
+        # Track decided request IDs to avoid re-proposing duplicate client retries.
+        # Key: (client_id, seq_num) tuple
+        # This prevents the same client request from being decided multiple times
+        # when clients retry due to message loss.
+        # =======================================================================
+        self.decided_request_ids = set()  # set of (client_id, seq_num) tuples
+        
+        # =======================================================================
+        # DECIDED VALUES (for cross-proposer deduplication)
+        # =======================================================================
+        # Track value strings that have been decided (from any proposer's batch).
+        # When our batch is rejected and another's is decided, we add those
+        # values here to avoid re-proposing them.
+        # =======================================================================
+        self.decided_values = set()  # set of value strings
 
     def run(self):
         """
@@ -135,11 +154,34 @@ class Proposer:
             # ===================================================================
             current_batch = []
             batch_start_time = None
+            batch_seen_req_ids = set()  # avoid same request multiple times in one batch
 
             # 1. Pre-fill batch from buffered client values
             while self.pending_client_values and len(current_batch) < self.BATCH_SIZE:
                 msg_data = self.pending_client_values.pop(0)
-                current_batch.append(msg_data['value'])
+                
+                # Extract request ID and value for deduplication
+                req_id = (msg_data.get('client_id'), msg_data.get('seq_num'))
+                val_str = msg_data.get('value', msg_data) if isinstance(msg_data, dict) else msg_data
+                
+                # Skip if request ID already decided (same client retry)
+                if req_id[0] is not None and req_id in self.decided_request_ids:
+                    logging.debug(f"Skipping duplicate request {req_id}")
+                    continue
+                
+                # Skip if this request ID is already in the current batch
+                if req_id[0] is not None and req_id in batch_seen_req_ids:
+                    logging.debug(f"Skipping duplicate request {req_id} in same batch")
+                    continue
+                
+                # Skip if value already decided (cross-proposer dedup)
+                if val_str in self.decided_values:
+                    logging.debug(f"Skipping already-decided value '{val_str}'")
+                    continue
+                
+                if req_id[0] is not None:
+                    batch_seen_req_ids.add(req_id)
+                current_batch.append(msg_data)
             
             # If we took something from the buffer, start the timer now
             if current_batch:
@@ -183,7 +225,28 @@ class Proposer:
                             continue
                         
                         # This is a valid Client message!
-                        current_batch.append(data['value'])
+                        # Check for duplicate request ID
+                        req_id = (data.get('client_id'), data.get('seq_num'))
+                        val_str = data.get('value', data) if isinstance(data, dict) else data
+                        
+                        # Skip if request ID already decided (same client retry)
+                        if req_id[0] is not None and req_id in self.decided_request_ids:
+                            logging.debug(f"Skipping duplicate request {req_id} (from network)")
+                            continue
+                        
+                        # Skip if this request ID is already in the current batch
+                        if req_id[0] is not None and req_id in batch_seen_req_ids:
+                            logging.debug(f"Skipping duplicate request {req_id} in same batch (from network)")
+                            continue
+                        
+                        # Skip if value already decided (cross-proposer dedup)
+                        if val_str in self.decided_values:
+                            logging.debug(f"Skipping already-decided value '{val_str}' (from network)")
+                            continue
+                        
+                        if req_id[0] is not None:
+                            batch_seen_req_ids.add(req_id)
+                        current_batch.append(data)
                         
                         # If this was the first element, start the timer now
                         if batch_start_time is None:
@@ -206,8 +269,16 @@ class Proposer:
             # ===================================================================
             # PREPARE VALUE TO PROPOSE
             # ===================================================================
-            # Ora 'value' non è più una stringa singola, ma una LISTA di stringhe
-            value = current_batch
+            # Extract value strings for Paxos (learners print these directly).
+            # Keep track of request IDs separately for our own deduplication.
+            # ===================================================================
+            batch_request_ids = []
+            value = []
+            for req in current_batch:
+                val_str = req.get('value', req) if isinstance(req, dict) else req
+                value.append(val_str)
+                if isinstance(req, dict) and req.get('client_id') is not None:
+                    batch_request_ids.append((req['client_id'], req['seq_num']))
             
             logging.info(f"Proposing batch of size {len(value)} for instance {self.next_instance}")
             
@@ -226,15 +297,36 @@ class Proposer:
                     # Record decision in our local view (soft state)
                     self.decided_instances[self.next_instance] = decided_value
                     
+                    # Mark all values in the decided batch as decided
+                    self._mark_batch_decided(decided_value)
+                    
                     if decided_value == value:
                         # Our value was decided at this instance
                         decided = True
-                        logging.info(f"Value '{value}' decided at instance {self.next_instance}")
+                        logging.info(f"Our batch decided at instance {self.next_instance}")
+                        
+                        # Mark our request IDs as decided
+                        for req_id in batch_request_ids:
+                            self.decided_request_ids.add(req_id)
                     else:
                         # A different value was decided (from prior acceptor state).
                         # This preserves safety: we adopt what was already chosen.
                         # Our value will be retried at the next instance.
-                        logging.info(f"Instance {self.next_instance} decided with different value '{decided_value}', retrying our value at next instance")
+                        logging.info(f"Instance {self.next_instance} decided with different batch, retrying our values")
+                        
+                        # Put rejected batch values back into pending buffer for retry.
+                        # Filter out any whose VALUE is already in decided_values; the
+                        # remaining ones will be picked up by the NEXT outer loop
+                        # iteration, which will build a fresh batch and value.
+                        for req in reversed(current_batch):
+                            val_str = req.get('value', req) if isinstance(req, dict) else req
+                            if val_str not in self.decided_values:
+                                self.pending_client_values.insert(0, req)
+
+                        # Break out of the inner retry loop so that the next iteration
+                        # of the outer loop rebuilds current_batch/value from the
+                        # updated pending_client_values (with decided_values applied).
+                        decided = True
                     
                     # Advance to next instance (this one is now closed)
                     self.next_instance += 1
@@ -242,6 +334,22 @@ class Proposer:
                     # Paxos round failed (timeout or preemption).
                     # Stay on the same instance and retry with a higher round.
                     logging.debug(f"Paxos round failed for instance {self.next_instance}, retrying")
+
+    def _mark_batch_decided(self, batch):
+        """
+        Mark all value strings in a decided batch as decided.
+        
+        This handles both our own batches and batches from other proposers.
+        Used to prevent re-proposing values that were already decided.
+        """
+        if not isinstance(batch, (list, tuple)):
+            # Single value
+            self.decided_values.add(str(batch))
+            return
+        
+        for val in batch:
+            self.decided_values.add(str(val))
+            logging.debug(f"Marked value '{val}' as decided")
 
     def _extract_accepted_history(self, data):
         """

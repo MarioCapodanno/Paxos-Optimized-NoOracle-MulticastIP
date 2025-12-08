@@ -23,7 +23,7 @@ LOSS=0.0
 CATCHUP=false
 SLEEP=2
 
-NUM_CLIENTS=2
+NUM_CLIENTS=3
 NUM_PROPOSERS=2
 NUM_ACCEPTORS=3
 NUM_LEARNERS=2
@@ -113,6 +113,7 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$script_dir/../"
 
+# Clean up old logs and prepare directory
 rm -rf logs
 mkdir -p logs
 

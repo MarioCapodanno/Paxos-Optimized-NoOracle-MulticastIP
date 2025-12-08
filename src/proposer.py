@@ -21,6 +21,7 @@ class Proposer:
         self.config = config
         self.id = id
         self.client_r = mcast_receiver(config["proposers"])
+        self.client_r.setblocking(False) # Optimization: Non-blocking for draining
         self.s = mcast_sender()
 
         # Number of acceptors and majority threshold for quorum
@@ -86,8 +87,8 @@ class Proposer:
         # =======================================================================
         # BATCHING CONFIGURATION
         # =======================================================================
-        self.BATCH_SIZE = 10        # Max number of requests per batch
-        self.BATCH_TIMEOUT = 0.05   # Max wait time (seconds) to fill a batch
+        self.BATCH_SIZE = 50        # Max number of requests per batch
+        self.BATCH_TIMEOUT = 0.005   # Max wait time (seconds) to fill a batch
         # =======================================================================
 
     def run(self):
@@ -167,24 +168,40 @@ class Proposer:
                     break
 
                 # There is a message ready to be read
-                try:
-                    msg, _ = self.client_r.recvfrom(2**16)
-                    data = json.loads(msg.decode())
-                    
-                    # Ignore Paxos protocol messages (noise on the channel)
-                    if data.get('type') in ['1B', '2B', 'DECISION']:
-                        continue
-                    
-                    # This is a valid Client message!
-                    current_batch.append(data['value'])
-                    
-                    # If this was the first element, start the timer now
-                    if batch_start_time is None:
-                        batch_start_time = time.time()
+                # OPTIMIZATION: Drain the socket to find client values(avoid multiple select calls)
+                drain_count = 0
+                while True:
+                    if drain_count > 100:
+                        break
+                    drain_count += 1
+                    try:
+                        msg, _ = self.client_r.recvfrom(2**16)
+                        data = json.loads(msg.decode())
                         
-                except Exception as e:
-                    logging.debug(f"Error decoding message in batch loop: {e}")
-                    continue
+                        # Ignore Paxos protocol messages (noise on the channel)
+                        if data.get('type') in ['1B', '2B', 'DECISION']:
+                            continue
+                        
+                        # This is a valid Client message!
+                        current_batch.append(data['value'])
+                        
+                        # If this was the first element, start the timer now
+                        if batch_start_time is None:
+                            batch_start_time = time.time()
+                        
+                        # If batch is full, break inner drain loop
+                        if len(current_batch) >= self.BATCH_SIZE:
+                            break
+                            
+                    except BlockingIOError:
+                        break # Socket empty
+                    except Exception as e:
+                        logging.debug(f"Error decoding message in batch loop: {e}")
+                        continue
+                
+                # If batch full, break outer select loop
+                if len(current_batch) >= self.BATCH_SIZE:
+                    break
 
             # ===================================================================
             # PREPARE VALUE TO PROPOSE

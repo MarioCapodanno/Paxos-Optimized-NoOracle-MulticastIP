@@ -130,7 +130,7 @@ class Proposer:
                         continue
                     
                     self.seen_requests.add(req_id)
-                    batch.append(value)
+                    batch.append({'cid': client_id, 'sn': seq_num, 'val': value})
                     
                     if not batch_start:
                         batch_start = time.time()

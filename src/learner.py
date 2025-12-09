@@ -18,6 +18,7 @@ class Learner:
         self.buffer = {}  # inst -> value
         self.votes = {}  # inst -> {val: set(aid)}
         self.catchup_votes = {}  # inst -> {val: count} for catchup
+        self.delivered_reqs = set()  # (client_id, seq_num) for deduplication
 
     def run(self):
         logging.debug(f"-> learner {self.id}")
@@ -49,22 +50,23 @@ class Learner:
         if inst in self.buffer:
             return
         
-        # Convert list to tuple for dict key
-        val = tuple(raw_val) if isinstance(raw_val, list) else raw_val
+        # Create hashable key for vote tracking
+        # raw_val is a list of dicts or a list of strings
+        val_key = json.dumps(raw_val, sort_keys=True) if isinstance(raw_val, list) else raw_val
         
         # Initialize vote tracking
         if inst not in self.votes:
             self.votes[inst] = {}
-        if val not in self.votes[inst]:
-            self.votes[inst][val] = set()
+        if val_key not in self.votes[inst]:
+            self.votes[inst][val_key] = set()
         
         # Add vote
-        self.votes[inst][val].add(aid)
+        self.votes[inst][val_key].add(aid)
         
         # Check for majority
-        if len(self.votes[inst][val]) >= self.majority:
-            # Store as list if it was a batch
-            self.buffer[inst] = list(val) if isinstance(val, tuple) else val
+        if len(self.votes[inst][val_key]) >= self.majority:
+            # Store original list in buffer for delivery
+            self.buffer[inst] = raw_val if isinstance(raw_val, list) else [raw_val]
             self.deliver()
 
     def deliver(self):
@@ -74,19 +76,35 @@ class Learner:
             # Handle batched values
             if isinstance(val, list):
                 for item in val:
-                    print(item)
-                    sys.stdout.flush()
-                    # Notify clients
-                    notification = {'value': item}
-                    self.s.sendto(json.dumps(notification).encode(), self.config["learners"])
+                    self._deliver_item(item)
             else:
-                print(val)
-                sys.stdout.flush()
-                # Notify clients
-                notification = {'value': val}
-                self.s.sendto(json.dumps(notification).encode(), self.config["learners"])
+                self._deliver_item(val)
             
             self.next_instance += 1
+    
+    def _deliver_item(self, item):
+        """Deliver a single item, handling deduplication."""
+        # Extract metadata if present (new format: {'cid', 'sn', 'val'})
+        if isinstance(item, dict) and 'cid' in item and 'sn' in item:
+            cid = item['cid']
+            sn = item['sn']
+            value = item['val']
+            
+            # Check for duplicate
+            req_id = (cid, sn)
+            if req_id in self.delivered_reqs:
+                logging.debug(f"Learner {self.id}: skipping duplicate {req_id}")
+                return
+            self.delivered_reqs.add(req_id)
+        else:
+            # Legacy format (just a value)
+            value = item
+        
+        print(value)
+        sys.stdout.flush()
+        # Notify clients
+        notification = {'value': value}
+        self.s.sendto(json.dumps(notification).encode(), self.config["learners"])
     
     def handle_catchup(self, msg):
         aid = msg.get('aid')

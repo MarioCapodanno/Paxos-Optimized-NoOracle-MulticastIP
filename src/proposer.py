@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import select
 import time
 from utils import mcast_receiver, mcast_sender, RndGeq
@@ -28,8 +29,13 @@ class Proposer:
         
         # Optimization 3: Batching
         self.BATCH_SIZE = 50
-        self.BATCH_TIMEOUT = 0.01  # 10ms to collect batch
+        self.BATCH_TIMEOUT = 0.05  # 50ms to collect batch (increased for better batching)
         self.pending_values = []  # Buffer for batching
+        
+        # Backoff parameters for contention handling
+        self.BASE_BACKOFF = 0.01  # 10ms base
+        self.MAX_BACKOFF = 0.5    # 500ms max
+        self.current_backoff = self.BASE_BACKOFF
 
     def run(self):
         logging.info(f"-> proposer {self.id}")
@@ -56,12 +62,26 @@ class Proposer:
                     if decided_value == batch:
                         decided = True
                         logging.info(f"Batch decided at instance {self.next_instance}")
+                        # Reset backoff on success
+                        self.current_backoff = self.BASE_BACKOFF
                     else:
                         logging.info(f"Different value decided, retrying our batch")
+                        # Small random delay to desync proposers without heavy backoff
+                        time.sleep(random.uniform(0.001, 0.01))
                     
                     self.next_instance += 1
                 else:
                     logging.debug(f"Paxos failed, retrying")
+                    # Apply backoff on failure
+                    self._apply_backoff()
+    
+    def _apply_backoff(self):
+        """Apply exponential backoff with jitter to reduce contention."""
+        # Add random jitter (0.5x to 1.5x of current backoff)
+        jitter = self.current_backoff * (0.5 + random.random())
+        time.sleep(jitter)
+        # Exponential increase, capped at MAX_BACKOFF
+        self.current_backoff = min(self.current_backoff * 2, self.MAX_BACKOFF)
     
     def try_prepare_next_instance(self):
         """Optimization 2: Run Phase1 before receiving client values"""

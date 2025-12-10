@@ -1,6 +1,6 @@
 import logging
 import json
-from utils import mcast_receiver, mcast_sender, decode_message, RndGeq
+from utils import mcast_receiver, mcast_sender, RndGeq
 
 
 class Acceptor:
@@ -9,8 +9,10 @@ class Acceptor:
         self.id = id
         self.r = mcast_receiver(config["acceptors"])
         self.s = mcast_sender()
-        self.instances = {}  # inst -> (rnd, v_rnd, v_val)
-        self.accepted_values = {}  # inst -> value (for catchup)
+        # instance state: promise round and last accepted value ((rnd, v_rnd, v_val))
+        self.instances = {}  # inst ->      
+        # Store accepted values per instance for learner catchup {(instance :value)}
+        self.accepted_values = {} 
 
     def run(self):
         logging.info(f"-> acceptor {self.id}")
@@ -31,15 +33,23 @@ class Acceptor:
                 self.handle_catchup(decoded)
 
     def handle_prepare(self, msg):
+        # Extract from 1A the target instance and proposed round number
         inst = msg['inst']
         rnd_val = msg['rnd']
         
-        rnd, v_rnd, v_val = self.instances.get(inst, ({'bal': 0, 'pid': 0}, {'bal': 0, 'pid': 0}, None))
+        logging.debug(f"Acceptor {self.id}: received 1A for instance {inst}, ballot {rnd_val}")
         
+        # Load current state for this instance, defaults mean "no promises/accepts yet"
+        rnd, v_rnd, v_val = self.instances.get(
+            inst, ({'bal': 0, 'pid': 0}, {'bal': 0, 'pid': 0}, None)
+        )
+        
+        # Only update our promised round and respond if the new round is >= current
         if RndGeq(rnd_val, rnd):
             rnd = rnd_val
             self.instances[inst] = (rnd, v_rnd, v_val)
             
+            # Send promise back, including any previously accepted value for this instance
             promise_msg = {
                 'type': '1B',
                 'inst': inst,
@@ -48,20 +58,32 @@ class Acceptor:
                 'v_val': v_val,
                 'aid': self.id
             }
+            logging.debug(f"Acceptor {self.id}: sending 1B (promise) for instance {inst}, ballot {rnd}")
             self.s.sendto(json.dumps(promise_msg).encode(), self.config["proposers"])
+        else:
+            logging.debug(f"Acceptor {self.id}: rejecting 1A for instance {inst}, ballot {rnd_val} < {rnd}")
     
     def handle_propose(self, msg):
         inst = msg['inst']
         rnd_val = msg['rnd']
         c_val = msg['val']
         
-        rnd, v_rnd, v_val = self.instances.get(inst, ({'bal': 0, 'pid': 0}, {'bal': 0, 'pid': 0}, None))
+        # Count values in batch for logging
+        batch_size = len(c_val) if isinstance(c_val, list) else 1
+        logging.debug(f"Acceptor {self.id}: received 2A for instance {inst}, ballot {rnd_val}, batch_size={batch_size}")
         
+        # Current promised/accepted state for this instance
+        rnd, v_rnd, v_val = self.instances.get(
+            inst, ({'bal': 0, 'pid': 0}, {'bal': 0, 'pid': 0}, None)
+        )
+        
+        # Accept only if the 2A round is >= promised round
         if RndGeq(rnd_val, rnd):
             rnd = rnd_val
             v_rnd = rnd_val
             v_val = c_val
             self.instances[inst] = (rnd, v_rnd, v_val)
+            # Track accepted value so learners can later reconstruct the log
             self.accepted_values[inst] = c_val  # Track for catchup
             
             accepted_msg = {
@@ -72,13 +94,18 @@ class Acceptor:
                 'aid': self.id
             }
             
+            logging.debug(f"Acceptor {self.id}: sending 2B (accept) for instance {inst}, batch_size={batch_size}")
+            # Notify proposers and learners about the acceptance
             self.s.sendto(json.dumps(accepted_msg).encode(), self.config["proposers"])
             self.s.sendto(json.dumps(accepted_msg).encode(), self.config["learners"])
+        else:
+            logging.debug(f"Acceptor {self.id}: rejecting 2A for instance {inst}, ballot {rnd_val} < {rnd}")
     
     def handle_catchup(self, msg):
-        lid = msg.get('lid', 'unknown')
+        lid = msg.get('lid') # learner_id
         logging.info(f"Acceptor {self.id}: received CATCHUP_REQUEST from learner {lid}")
         
+        # Send back all values we have accepted so far, indexed by instance
         response = {
             'type': 'CATCHUP_RESPONSE',
             'aid': self.id,

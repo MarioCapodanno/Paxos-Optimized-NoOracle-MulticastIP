@@ -36,35 +36,6 @@ def mcast_sender(ttl=1):
     return send_sock
 
 
-def decode_message(msg_bytes):
-    """Decode a Paxos message from bytes to tuple"""
-    msg_str = msg_bytes.decode()
-    
-    # Try JSON first (for MultiPaxos)
-    try:
-        data = json.loads(msg_str)
-        if isinstance(data, dict) and 'type' in data:
-            return data
-    except (json.JSONDecodeError, ValueError):
-        pass
-    
-    # Fall back to pipe-separated format (for backward compatibility)
-    parts = msg_str.split("|")  # msg is in the format "msg_type|arg1|arg2|..."
-
-    # Convert numeric fields
-    converted_parts = [parts[0]]  # msg_type stays as string
-    for part in parts[1:]:
-        if part == "None":
-            converted_parts.append(None)
-        else:
-            # Try to convert to int
-            try:
-                converted_parts.append(int(part))
-            except ValueError:
-                converted_parts.append(part)
-
-    return tuple(converted_parts)
-
 def RndGeq(rnd1, rnd2):
     """
     Compare two ballot/round numbers according to TLA+ specification.

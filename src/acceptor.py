@@ -2,7 +2,6 @@ import logging
 import json
 from utils import mcast_receiver, mcast_sender, RndGeq
 
-
 class Acceptor:
     def __init__(self, config, id):
         self.config = config

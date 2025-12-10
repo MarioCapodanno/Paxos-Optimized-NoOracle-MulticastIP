@@ -4,6 +4,8 @@ import select
 import time
 from utils import mcast_receiver, mcast_sender, RndGeq
 
+NUM_PROPOSERS = 2
+NUM_ACCEPTORS = 3
 
 class Proposer:
     def __init__(self, config, id):
@@ -12,6 +14,30 @@ class Proposer:
         self.r = mcast_receiver(config["proposers"])
         self.r.setblocking(False)
         self.s = mcast_sender()
+        
+        self.majority = (NUM_ACCEPTORS // 2) + 1
+        # This counter tracks the next known available instance
+        self.next_instance = 0
+        self.c_rnd = self.id - 1
+        # Buffer for client values that arrive while processing Paxos messages
+        self.pending_client_values = []
+
+    def sync_instance(self):
+        """Non-blockingly read all pending decisions to update our instance counter."""
+        while True:
+            # Poll the learner socket with a zero timeout.
+            ready, _, _ = select.select([self.learner_r], [], [], 0.0)
+            if not ready:
+                break  # No more pending decision messages
+            
+            msg, _ = self.learner_r.recvfrom(2**16)
+            try:
+                data = json.loads(msg.decode())
+                if data.get('type') == 'DECISION':
+                    # A decision was made. Ensure our next instance is ahead of it.
+                    self.next_instance = max(self.next_instance, data['inst'] + 1)
+            except (json.JSONDecodeError, KeyError):
+                continue
 
         # Paxos quorum configuration
         self.num_acceptors = 3

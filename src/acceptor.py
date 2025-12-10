@@ -26,13 +26,13 @@ class Acceptor:
             msg_type = decoded.get('type')
             
             if msg_type == "1A":
-                self.handle_prepare(decoded)
+                self.handle_1A(decoded)
             elif msg_type == "2A":
-                self.handle_propose(decoded)
+                self.handle_2A(decoded)
             elif msg_type == "CATCHUP_REQUEST":
                 self.handle_catchup(decoded)
 
-    def handle_prepare(self, msg):
+    def handle_1A(self, msg):
         # Extract from 1A the target instance and proposed round number
         inst = msg['inst']
         rnd_val = msg['rnd']
@@ -63,7 +63,7 @@ class Acceptor:
         else:
             logging.debug(f"Acceptor {self.id}: rejecting 1A for instance {inst}, ballot {rnd_val} < {rnd}")
     
-    def handle_propose(self, msg):
+    def handle_2A(self, msg):
         inst = msg['inst']
         rnd_val = msg['rnd']
         c_val = msg['val']

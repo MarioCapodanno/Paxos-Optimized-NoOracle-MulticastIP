@@ -78,7 +78,7 @@ class Learner:
         if val_key not in self.votes[inst]:
             self.votes[inst][val_key] = set()
         
-        # Record this acceptor's vote
+        # Record this acceptor vote
         self.votes[inst][val_key].add(aid)
         
         # If we see a majority of 2B for the same value, consider it decided
@@ -96,9 +96,9 @@ class Learner:
             # Handle batched values
             if isinstance(val, list):
                 for item in val:
-                    self._deliver_item(item)
+                    self.deliver_value(item)
             else:
-                self._deliver_item(val)
+                self.deliver_value(val)
             
             self.next_instance += 1
             delivered_any = True
@@ -107,7 +107,7 @@ class Learner:
         if delivered_any:
             self.catchup_pending = False
     
-    def _deliver_item(self, item):
+    def deliver_value(self, item):
         # Extract metadata if present (new format: {'cid', 'sn', 'val'})
         if isinstance(item, dict) and 'cid' in item and 'sn' in item:
             cid = item['cid']

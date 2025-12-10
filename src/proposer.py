@@ -43,7 +43,7 @@ class Proposer:
         while True:
             # Mil3_Opt1: Try Phase 1 if not client value received
             if not self.pending_values:
-                self.try_prepare_next_instance()
+                self.phase1_opt()
             
             # Mil3_Opt3: Collect batch of values
             batch = self.collect_batch()
@@ -76,7 +76,7 @@ class Proposer:
                 else:
                     logging.debug(f"Paxos failed, retrying immediately")
     
-    def try_prepare_next_instance(self):
+    def phase1_opt(self):
         # Check if we need to run a fresh Phase 1 for the current instance
         # or if we can reuse existing prepared state
         if (self.prepared_instance != self.next_instance or 

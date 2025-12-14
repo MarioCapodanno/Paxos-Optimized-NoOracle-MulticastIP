@@ -10,6 +10,12 @@ class Proposer:
         self.config = config
         self.id = id
         self.r = mcast_receiver(config["proposers"])
+        # Set non-blocking to allow timeouts, otherwise recvfrom() would block indefinitely
+        # Example:
+        # - no messages to receive: 
+        #      ready, _, _ = select.select([self.r], [], [], 0.1) -> ready = []
+        # - message received:
+        #      ready, _, _ = select.select([self.r], [], [], 0.1) -> ready = [self.r]
         self.r.setblocking(False)
         self.s = mcast_sender()
 
@@ -38,13 +44,17 @@ class Proposer:
 
     def run(self):
 
+        # Logging always printed in the proposer log file
         logging.info(f"-> proposer {self.id}")
         
         while True:
+
+            #================PHASE 1 OPTIMIZATION ================#
             # Mil3_Opt1: Try Phase 1 if not client value received
             if not self.pending_values:
                 self.phase1_opt()
             
+            #================BATCH COLLECTION ================#
             # Mil3_Opt3: Collect batch of values
             batch = self.collect_batch()
             
@@ -56,6 +66,8 @@ class Proposer:
             logging.debug(f"Collected batch: {batch_vals[:5]}{'...' if len(batch_vals) > 5 else ''} ({len(batch)} values)")
             logging.info(f"Proposing batch of {len(batch)} values for instance {self.next_instance}")
             
+            #================PAXOS RUNNING ================#
+            # Flag to track if the current instance where Proposer is working is decided
             decided = False
 
             # If for the current instance, the batch is not decided, run Paxos
@@ -63,25 +75,30 @@ class Proposer:
             while not decided:
                 success, decided_value = self.run_paxos(batch)
                 
-                if success: # istances decided in the current proposer round
+                # Check if Paxos was successful
+                if success: 
+                    # Check if the decided value is our batch
                     if decided_value == batch:
                         decided = True
                         logging.info(f"Batch decided at instance {self.next_instance}")
                     else:
                         # Another proposer won this instance with a different value
                         # Retry our batch at the next instance to ensure all values get decided
-                        logging.debug(f"Different value decided, retrying our batch")
+                        logging.debug(f"Different value decided, retrying our batch in the next instance")
                     
                     self.next_instance += 1
                 else:
+                    # Paxos is considered failed if timeout occurs during phase1 or phase2
                     logging.debug(f"Paxos failed, retrying immediately")
     
     def phase1_opt(self):
         # Check if we need to run a fresh Phase 1 for the current instance
         # or if we can reuse existing prepared state
+        # If conditions met, run Phase 1 and store promises for future use
+        # otherwise, skip Phase 1 because we can reuse existing state (no client values yet and already prepared)
         if (self.prepared_instance != self.next_instance or 
             self.prepared_promises is None):
-            
+
             self.round_counter += 1
             next_round = {'bal': self.round_counter, 'pid': self.id}
             
@@ -109,22 +126,28 @@ class Proposer:
             # Calculate remaining time
             if batch:
                 elapsed = time.time() - batch_start
+                # If timeout reached, break and return collected batch
                 if elapsed >= self.BATCH_TIMEOUT:
                     break
                 wait_time = self.BATCH_TIMEOUT - elapsed
             else:
                 wait_time = None
             
+            # If batch is empty, then wait_time is None -> block until a message arrives
+            # Otherwise, wait until batch timeout expires
+            # N.B. : Remember that the outer while loop checks the batch size condition
             ready, _, _ = select.select([self.r], [], [], wait_time)
+
             if not ready:
                 break
             
+            # If the socket is ready, try to receive messages until no more are available or batch is full
             while len(batch) < self.BATCH_SIZE:
                 try:
                     msg, _ = self.r.recvfrom(2**16)
                     data = json.loads(msg.decode())
                     
-                    # Ignore paxos messages
+                    # Ignore paxos messages (paxos messages have 'type' field for example '1A', '1B', '2A', '2B')
                     if 'type' in data:
                         continue
                     
@@ -133,10 +156,13 @@ class Proposer:
                     seq_num = data.get('seq_num')
                     value = data.get('value')
                     
+                    # Skip invalid messages (usually not happens but just in case)
                     if client_id is None or seq_num is None or value is None:
                         continue
                     
-                    # Check for duplicate
+                    # Check for duplicate requests from client
+                    # N.B.: It could happen that a client request arrives here while we are in phase 1 or 2
+                    #       In that case, we still need to track it to avoid proposing it multiple times 
                     req_id = (client_id, seq_num)
                     if req_id in self.seen_requests:
                         logging.debug(f"Duplicate request {req_id}, skipping")
@@ -145,6 +171,8 @@ class Proposer:
                     self.seen_requests.add(req_id)
                     batch.append({'cid': client_id, 'sn': seq_num, 'val': value})
                     
+                    # If this is the first message in the batch (so, we did not have any in pending_values before) 
+                    # start the batch timer
                     if not batch_start:
                         batch_start = time.time()
                 except:
@@ -153,7 +181,7 @@ class Proposer:
         return batch
 
     def run_paxos(self, value):
-        # Instance index we are trying to decide now
+        # Instance index we are trying to decide in this run
         inst = self.next_instance
         
         # Mil3_Opt1: Reuse prepared Phase1 if available
@@ -177,6 +205,8 @@ class Proposer:
             if not ok:
                 # Could not get a majority of promises (e.g., timeout)
                 return (False, None)
+        
+        # ================MAJORITY PROMISES COLLECTED================#
         
         # Value selection according to Paxos rules:
         #   - iff any acceptor already accepted a value, we must propose the one
@@ -244,6 +274,7 @@ class Proposer:
                 client_id = data.get('client_id')
                 seq_num = data.get('seq_num')
                 value = data.get('value')
+                # Check if valid client request
                 if client_id is not None and seq_num is not None and value is not None:
                     req_id = (client_id, seq_num)
                     # Buffer it only if it's a new value request
@@ -256,6 +287,7 @@ class Proposer:
             if (data.get('type') == '1B' and 
                 data.get('inst') == inst and 
                 data.get('rnd') == c_rnd):
+                # aid = acceptor id
                 aid = data.get('aid')
                 promises[aid] = data
         

@@ -23,6 +23,7 @@ class Acceptor:
             except:
                 continue
             
+            # Acceptor expects messages of type 1A, 2A, CATCHUP_REQUEST only
             msg_type = decoded.get('type')
             
             if msg_type == "1A":
@@ -39,7 +40,7 @@ class Acceptor:
         
         logging.debug(f"Acceptor {self.id}: received 1A for instance {inst}, ballot {rnd_val}")
         
-        # Load current state for this instance, defaults mean "no promises/accepts yet"
+        # Load current state for this instance, defaults mean "no promises/accepts yet" (things after inst)
         rnd, v_rnd, v_val = self.instances.get(
             inst, ({'bal': 0, 'pid': 0}, {'bal': 0, 'pid': 0}, None)
         )
@@ -49,7 +50,7 @@ class Acceptor:
             rnd = rnd_val
             self.instances[inst] = (rnd, v_rnd, v_val)
             
-            # Send promise back, including any previously accepted value for this instance
+            # Send promise back to proposers
             promise_msg = {
                 'type': '1B',
                 'inst': inst,

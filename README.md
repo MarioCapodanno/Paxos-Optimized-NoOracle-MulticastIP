@@ -5,6 +5,10 @@ The implementation is accomplished through three milestones:
 2) Multi Paxos
 3) Optimizations
 
+![](scripts/plotting/SystemArchitectureDiagram.png)
+
+
+
 ## Dependencies and preliminaries
 
 The bash scripts can be runned from a clean Ubuntu 24.04 image. You may need `sudo` access to run the scripts.

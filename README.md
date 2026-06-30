@@ -68,44 +68,37 @@ of processes that need to agree on a single value. More commonly though, process
 of totally ordered values - a problem known as atomic broadcast.
 
 In this implementation, four roles are provided:
-• clients: submit values to proposers
-• proposers: coordinate Paxos rounds to propose values to be decided
-• acceptors: Paxos acceptors
-• learners: learn about the sequence of values as they are decided
+
+- clients: submit values to proposers
+- proposers: coordinate Paxos rounds to propose values to be decided
+- acceptors: Paxos acceptors
+- learners: learn about the sequence of values as they are decided
 
 The protocol always guarantees safety. To guarantee liveness, in a complete Paxos implementation, one of
 the proposers should be elected as the leader. For simplicity, in this project, the 
 leader election oracle is not implemented. However, no assumptions are made about which proposer is the leader, and more than one proposer. Therefore, if two proposers are proposing in parallel and preventing each other from executing Phase 2 of the protocol, they will keep trying until one of them succeeds.
+
 ## Assumptions
+
 We assume only crash failures. That is, processes fail by halting and do not recover. This allows the following
 simplifications:
-• no need to implement a recovery procedure for acceptors or learners
-• all state can be kept in memory - no need to use stable storage
+- no need to implement a recovery procedure for acceptors or learners
+- all state can be kept in memory - no need to use stable storage
 Implementation
 ## Implementation Details: 
-• Based on IP multicast only and supports four different multicast groups, one for each role of the protocol.
+
+Based on IP multicast only and supports four different multicast groups, one for each role of the protocol.
 We followed 3 milestones for the implementation:
 1. Synod algorithm: the basic version of Paxos. It supports the decision of a single value.
 2. MultiPaxos: an extension of the Synod algorithm to support atomic broadcast. It supports the decision of
 multiple values in the same total order.
 3. Optimizations: we will focus on 3 of them:
-• One communication step is saved by allowing acceptors to send the PH2B messages directly to the learners.
-• Two more communication steps are saved on the critical path by the proposers performing PHASE1 before
+- One communication step is saved by allowing acceptors to send the PH2B messages directly to the learners.
+- Two more communication steps are saved on the critical path by the proposers performing PHASE1 before
 receiving the value from the clients.
-• With batching, more values can be decided in a single instance of the Synod algorithm.
+- With batching, more values can be decided in a single instance of the Synod algorithm.
 Also, the implementation guarantees the following:
-• message loss or processes crashing should never violate safety (total order, agreement or integrity)
-• if a majority of acceptors are killed, no progress should be made (asynchronous consensus assumption)
-• learning values must be possible if there are a majority of acceptors and 1 of each other role (no crashes or
+- message loss or processes crashing should never violate safety (total order, agreement or integrity)
+- if a majority of acceptors are killed, no progress should be made (asynchronous consensus assumption)
+- learning values must be possible if there are a majority of acceptors and 1 of each other role (no crashes or
 message loss)
-
-
-At the end of the project we expect a working system, that can be easily tested on a cluster of machines.
-Presentations
-Each group will have 5 minutes to present the implementation. The implementation should include:
-• A general overview of the system design
-• The main difficulties you encountered, and how you addressed them
-• The final takeaways from the project
-Each presentation will be followed by a few questions. We expect all people in the group to be able to answer them.
-The grade of your project will also consider the source code correctness, completeness, readability and performance.
-2

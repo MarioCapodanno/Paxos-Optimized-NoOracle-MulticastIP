@@ -27,7 +27,7 @@ where `IFACE` is the name of the interface. Using a connected cable/wifi interfa
 
 1. `cd` to this directory. All the scripts should be run from here. Make sure the scripts in the `scripts` folder have executable permissions.
 
-2. Permorm a run and check the results as follows:
+2. Perform a run and check the results as follows:
 ```
 scripts/run.sh -n 1000
 scripts/check.sh

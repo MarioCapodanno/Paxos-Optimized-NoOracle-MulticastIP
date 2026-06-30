@@ -93,12 +93,12 @@ We followed 3 milestones for the implementation:
 2. MultiPaxos: an extension of the Synod algorithm to support atomic broadcast. It supports the decision of
 multiple values in the same total order.
 3. Optimizations: we will focus on 3 of them:
-- One communication step is saved by allowing acceptors to send the PH2B messages directly to the learners.
-- Two more communication steps are saved on the critical path by the proposers performing PHASE1 before
+    - One communication step is saved by allowing acceptors to send the PH2B messages directly to the learners.
+    - Two more communication steps are saved on the critical path by the proposers performing PHASE1 before
 receiving the value from the clients.
-- With batching, more values can be decided in a single instance of the Synod algorithm.
+    - With batching, more values can be decided in a single instance of the Synod algorithm.
 Also, the implementation guarantees the following:
-- message loss or processes crashing should never violate safety (total order, agreement or integrity)
-- if a majority of acceptors are killed, no progress should be made (asynchronous consensus assumption)
-- learning values must be possible if there are a majority of acceptors and 1 of each other role (no crashes or
+        - message loss or processes crashing should never violate safety (total order, agreement or integrity)
+        - if a majority of acceptors are killed, no progress should be made (asynchronous consensus assumption)
+        - learning values must be possible if there are a majority of acceptors and 1 of each other role (no crashes or
 message loss)
